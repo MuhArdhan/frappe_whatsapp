@@ -17,6 +17,7 @@
   "column_break_byyq",
   "phone_id",
   "app_id",
+  "app_secret",
   "business_id",
   "is_default_incoming",
   "is_default_outgoing",
@@ -55,6 +56,12 @@
    "fieldname": "app_id",
    "fieldtype": "Data",
    "label": "App ID"
+  },
+  {
+   "description": "Meta App Secret. When set, webhook calls without a valid X-Hub-Signature-256 are rejected.",
+   "fieldname": "app_secret",
+   "fieldtype": "Password",
+   "label": "App Secret"
   },
   {
    "fieldname": "webhook_verify_token",

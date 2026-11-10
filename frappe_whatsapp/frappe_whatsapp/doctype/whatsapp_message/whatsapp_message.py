@@ -1,7 +1,10 @@
 # Copyright (c) 2022, Shridhar Patil and contributors
 # For license information, please see license.txt
 import json
+import mimetypes
+
 import frappe
+import requests
 from frappe import _, throw
 from frappe.model.document import Document
 from frappe.integrations.utils import make_post_request
@@ -73,10 +76,9 @@ class WhatsAppMessage(Document):
             return
 
         if self.message_type != "Template":
-            if self.attach and not self.attach.startswith("http"):
-                link = frappe.utils.get_url() + "/" + self.attach
-            else:
-                link = self.attach
+            media = None
+            if self.attach and self.content_type in ["document", "image", "video", "audio"]:
+                media = self.media_payload()
 
             data = {
                 "messaging_product": "whatsapp",
@@ -86,10 +88,9 @@ class WhatsAppMessage(Document):
             if self.is_reply and self.reply_to_message_id:
                 data["context"] = {"message_id": self.reply_to_message_id}
             if self.content_type in ["document", "image", "video"]:
-                data[self.content_type.lower()] = {
-                    "link": link,
-                    "caption": self.message,
-                }
+                data[self.content_type.lower()] = media
+                if self.message:
+                    media["caption"] = self.message
             elif self.content_type == "reaction":
                 data["reaction"] = {
                     "message_id": self.reply_to_message_id,
@@ -99,7 +100,7 @@ class WhatsAppMessage(Document):
                 data["text"] = {"preview_url": True, "body": self.message}
 
             elif self.content_type == "audio":
-                data["audio"] = {"link": link}
+                data["audio"] = media
 
             elif self.content_type == "interactive":
                 # Interactive message (buttons or list)
@@ -193,6 +194,37 @@ class WhatsAppMessage(Document):
                 frappe.throw(f"Failed to send message {str(e)}")
         elif not self.message_id:
             self.send_template()
+
+    def media_payload(self):
+        """Media object for the Cloud API.
+
+        Site files are uploaded to Meta: a link only works for public files on a
+        publicly reachable site, which private (helpdesk) attachments never are.
+        """
+        if self.attach.startswith("http"):
+            payload = {"link": self.attach}
+            file_name = self.attach.split("?")[0].rsplit("/", 1)[-1]
+        else:
+            file_doc = frappe.get_doc("File", {"file_url": self.attach})
+            file_name = file_doc.file_name
+            payload = {"id": self.upload_media(file_doc)}
+        if self.content_type == "document":
+            payload["filename"] = file_name
+        return payload
+
+    def upload_media(self, file_doc):
+        account = frappe.get_doc("WhatsApp Account", self.whatsapp_account)
+        mime_type = mimetypes.guess_type(file_doc.file_name)[0] or "application/octet-stream"
+        response = requests.post(
+            f"{account.url}/{account.version}/{account.phone_id}/media",
+            headers={"authorization": f"Bearer {account.get_password('token')}"},
+            data={"messaging_product": "whatsapp", "type": mime_type},
+            files={"file": (file_doc.file_name, file_doc.get_content(), mime_type)},
+            timeout=60,
+        )
+        if not response.ok:
+            throw(_("Media upload to WhatsApp failed: {0}").format(response.text))
+        return response.json()["id"]
 
     def send_template(self):
         """Send template."""

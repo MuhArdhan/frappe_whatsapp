@@ -1,4 +1,6 @@
 """Webhook."""
+import hashlib
+import hmac
 import frappe
 import json
 import requests
@@ -35,8 +37,27 @@ def get():
 
 	return Response(hub_challenge, status=200)
 
+def verify_signature():
+	"""Reject POSTs not signed by Meta with one of the accounts' App Secrets."""
+	secrets = [
+		frappe.get_doc("WhatsApp Account", name).get_password("app_secret", raise_exception=False)
+		for name in frappe.get_all("WhatsApp Account", pluck="name")
+	]
+	secrets = [s for s in secrets if s]
+	if not secrets:
+		return  # shortcut: unsigned calls accepted until an App Secret is set; set it before going live
+	signature = frappe.get_request_header("X-Hub-Signature-256") or ""
+	body = frappe.request.get_data()
+	for secret in secrets:
+		expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+		if hmac.compare_digest(signature, expected):
+			return
+	frappe.throw(_("Invalid webhook signature"), frappe.PermissionError)
+
+
 def post():
 	"""Post."""
+	verify_signature()
 	data = frappe.local.form_dict
 	frappe.get_doc({
 		"doctype": "WhatsApp Notification Log",

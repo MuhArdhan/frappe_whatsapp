@@ -217,5 +217,14 @@ doc_events = {
         "after_delete": "frappe_whatsapp.utils.run_server_script_for_doc_event",
         "before_update_after_submit": "frappe_whatsapp.utils.run_server_script_for_doc_event",
         "on_update_after_submit": "frappe_whatsapp.utils.run_server_script_for_doc_event"
-    }
+    },
+    # Helpdesk bridge (no-ops on sites without helpdesk)
+    "WhatsApp Message": {"on_update": "frappe_whatsapp.helpdesk.on_whatsapp_message"},
+    "Communication": {"after_insert": "frappe_whatsapp.helpdesk.on_communication"},
 }
+
+override_doctype_class = {
+    "HD Ticket": "frappe_whatsapp.helpdesk_ticket.WhatsAppHDTicket",
+}
+
+after_migrate = ["frappe_whatsapp.helpdesk.setup_custom_fields"]
