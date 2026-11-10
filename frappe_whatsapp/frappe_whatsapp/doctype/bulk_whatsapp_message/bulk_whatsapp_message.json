@@ -1,0 +1,256 @@
+{
+ "actions": [],
+ "beta": 1,
+ "creation": "2023-05-10 12:00:00",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "title",
+  "from_number",
+  "column_break_fpdx",
+  "section_recipients",
+  "recipient_type",
+  "recipient_list",
+  "recipient_count",
+  "column_break_xvnh",
+  "recipients",
+  "section_message",
+  "use_template",
+  "is_mpm",
+  "template",
+  "variable_type",
+  "attach",
+  "whatsapp_account",
+  "column_break_hztf",
+  "template_variables",
+  "thumbnail_product_retailer_id",
+  "mpm_header",
+  "product_ids",
+  "section_status",
+  "status",
+  "scheduled_time",
+  "column_break_hwbk",
+  "amended_from",
+  "sent_count"
+ ],
+ "fields": [
+  {
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Title",
+   "reqd": 1
+  },
+  {
+   "fieldname": "from_number",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "in_list_view": 1,
+   "label": "From WhatsApp Number"
+  },
+  {
+   "fieldname": "section_recipients",
+   "fieldtype": "Section Break",
+   "label": "Recipients"
+  },
+  {
+   "default": "Individual",
+   "fieldname": "recipient_type",
+   "fieldtype": "Select",
+   "label": "Recipient Type",
+   "options": "\nIndividual\nRecipient List"
+  },
+  {
+   "depends_on": "eval:doc.recipient_type=='Individual'",
+   "fieldname": "recipients",
+   "fieldtype": "Table",
+   "label": "Recipients",
+   "options": "WhatsApp Recipient"
+  },
+  {
+   "depends_on": "eval:doc.recipient_type=='Recipient List'",
+   "fieldname": "recipient_list",
+   "fieldtype": "Link",
+   "label": "Recipient List",
+   "options": "WhatsApp Recipient List"
+  },
+  {
+   "fieldname": "recipient_count",
+   "fieldtype": "Int",
+   "label": "Recipient Count",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_message",
+   "fieldtype": "Section Break",
+   "label": "Message"
+  },
+  {
+   "default": "0",
+   "fieldname": "use_template",
+   "fieldtype": "Check",
+   "label": "Use Template"
+  },
+  {
+   "depends_on": "eval:doc.use_template==1",
+   "description": "Make sure that Template variables are same as Recipient data fields",
+   "fieldname": "template",
+   "fieldtype": "Link",
+   "label": "Template",
+   "options": "WhatsApp Templates"
+  },
+  {
+   "depends_on": "eval:doc.use_template==1",
+   "fieldname": "template_variables",
+   "fieldtype": "Code",
+   "label": "Template Variables",
+   "options": "JSON"
+  },
+  {
+   "fieldname": "section_status",
+   "fieldtype": "Section Break",
+   "label": "Status"
+  },
+  {
+   "default": "Draft",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "Draft\nScheduled\nQueued\nIn Progress\nCompleted\nPartially Failed",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "sent_count",
+   "fieldtype": "Int",
+   "label": "Sent Count",
+   "read_only": 1
+  },
+  {
+   "description": "Leave empty to send immediately after submission",
+   "fieldname": "scheduled_time",
+   "fieldtype": "Datetime",
+   "label": "Scheduled Time"
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "no_copy": 1,
+   "options": "Bulk WhatsApp Message",
+   "print_hide": 1,
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.use_template==1",
+   "fieldname": "attach",
+   "fieldtype": "Attach",
+   "label": "Attach"
+  },
+  {
+   "default": "Common",
+   "depends_on": "eval:doc.use_template==1",
+   "fieldname": "variable_type",
+   "fieldtype": "Select",
+   "label": "Variable Type",
+   "options": "Common\nUnique"
+  },
+  {
+   "fieldname": "whatsapp_account",
+   "fieldtype": "Link",
+   "label": "Whatsapp Account",
+   "options": "WhatsApp Account"
+  },
+  {
+   "fieldname": "column_break_xvnh",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "column_break_hztf",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "column_break_hwbk",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "description": "Enables Multi-Product Message.",
+   "fieldname": "is_mpm",
+   "fieldtype": "Check",
+   "label": "Enable MPM"
+  },
+  {
+   "depends_on": "eval:doc.is_mpm==1",
+   "description": "A comma-separated list of Content IDs (also known as Retailer IDs) from your Meta Catalog. 7jz1ottjd2, oidpztf4vp etc.",
+   "fieldname": "product_ids",
+   "fieldtype": "Code",
+   "label": "Product IDs",
+   "mandatory_depends_on": "eval:doc.is_mpm==1"
+  },
+  {
+   "fieldname": "column_break_fpdx",
+   "fieldtype": "Column Break"
+  },
+  {
+   "depends_on": "eval:doc.is_mpm==1",
+   "description": "The text that appears at the very top of the multi-product message.",
+   "fieldname": "mpm_header",
+   "fieldtype": "Data",
+   "label": "MPM Header"
+  },
+  {
+   "depends_on": "eval:doc.is_mpm==1",
+   "description": "Provide any of your products id to use its image.",
+   "fieldname": "thumbnail_product_retailer_id",
+   "fieldtype": "Data",
+   "label": "Thumbnail Product",
+   "mandatory_depends_on": "eval:doc.is_mpm==1"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "is_submittable": 1,
+ "links": [],
+ "modified": "2026-02-11 01:17:05.293810",
+ "modified_by": "Administrator",
+ "module": "Frappe Whatsapp",
+ "name": "Bulk WhatsApp Message",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "amend": 1,
+   "cancel": 1,
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  },
+  {
+   "amend": 1,
+   "cancel": 1,
+   "create": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "WhatsApp Manager",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
