@@ -55,15 +55,18 @@ def send(msg):
 	if msg.message_type == "Template" or msg.template:
 		frappe.throw(_("Templates are only supported by the Meta Cloud API provider"))
 
+	# Evolution looks the quoted message up by id in its own store
+	quoted = {"quoted": {"key": {"id": msg.reply_to_message_id}}} if msg.is_reply and msg.reply_to_message_id else {}
+
 	if kind == "text":
-		res = api(account, "POST", f"/message/sendText/{inst}", {"number": number, "text": msg.message})
+		res = api(account, "POST", f"/message/sendText/{inst}", {"number": number, "text": msg.message, **quoted})
 	elif kind == "interactive":
 		# list/button messages are unreliable on WhatsApp Web, so send a numbered menu
 		res = api(account, "POST", f"/message/sendText/{inst}", {"number": number, "text": numbered_menu(msg)})
 	elif kind in MEDIA_TYPES and msg.attach:
 		file_name, mime_type, media = media_source(msg.attach)
 		if kind == "audio":
-			res = api(account, "POST", f"/message/sendWhatsAppAudio/{inst}", {"number": number, "audio": media})
+			res = api(account, "POST", f"/message/sendWhatsAppAudio/{inst}", {"number": number, "audio": media, **quoted})
 		else:
 			res = api(
 				account,
@@ -76,6 +79,7 @@ def send(msg):
 					"caption": msg.message or "",
 					"fileName": file_name,
 					"media": media,
+					**quoted,
 				},
 			)
 	else:
@@ -242,11 +246,18 @@ def save_incoming(account, data):
 		frappe.get_doc(doc).insert(ignore_permissions=True)
 		return
 
+	ctx = data.get("contextInfo") or next(
+		(v["contextInfo"] for v in message.values() if isinstance(v, dict) and v.get("contextInfo")), {}
+	)
+	quoted_text = None
+	if ctx.get("stanzaId"):  # customer replied to a specific message
+		doc.update(is_reply=1, reply_to_message_id=ctx["stanzaId"])
+		quoted_text = text_of(unwrap(ctx.get("quotedMessage") or {}))
+
 	media_kind = next((k for k in MEDIA_TYPES if f"{k}Message" in message), None)
 	if not media_kind:
-		text = message.get("conversation") or (message.get("extendedTextMessage") or {}).get("text")
-		doc.update(content_type="text", message=text or f"[{data.get('messageType') or 'unsupported message'}]")
-		frappe.get_doc(doc).insert(ignore_permissions=True)
+		doc.update(content_type="text", message=text_of(message) or f"[{data.get('messageType') or 'unsupported message'}]")
+		new_message(doc, quoted_text).insert(ignore_permissions=True)
 		return
 
 	media = message[f"{media_kind}Message"]
@@ -256,7 +267,9 @@ def save_incoming(account, data):
 	file_name = media.get("fileName") or f"{frappe.generate_hash(length=10)}{mimetypes.guess_extension(mime_type) or ''}"
 
 	# two saves like the Meta webhook: the helpdesk bridge routes media once `attach` is set
-	msg = frappe.get_doc({**doc, "content_type": media_kind, "message": media.get("caption") or ""}).insert(ignore_permissions=True)
+	msg = new_message({**doc, "content_type": media_kind, "message": media.get("caption") or ""}, quoted_text).insert(
+		ignore_permissions=True
+	)
 	file_doc = frappe.get_doc(
 		{
 			"doctype": "File",
@@ -270,6 +283,21 @@ def save_incoming(account, data):
 	).save(ignore_permissions=True)
 	msg.attach = file_doc.file_url
 	msg.save(ignore_permissions=True)
+
+
+def new_message(doc, quoted_text):
+	msg = frappe.get_doc(doc)
+	# fallback for the helpdesk quote when the quoted message never passed through Frappe (sent from the phone)
+	msg.flags.quoted_text = quoted_text
+	return msg
+
+
+def text_of(message):
+	return (
+		message.get("conversation")
+		or (message.get("extendedTextMessage") or {}).get("text")
+		or next((message[f"{k}Message"].get("caption") for k in MEDIA_TYPES if f"{k}Message" in message), None)
+	)
 
 
 def sender_number(key):

@@ -140,11 +140,15 @@ def _check_flow(sent):
 
 def _check_format_and_contact():
 	# agent editor HTML -> WhatsApp markup, no markdown or backslash escapes
-	text, _ = helpdesk.split_inline_images(
+	text, *_ = helpdesk.split_inline_images(
 		"<p>Halo <b>Budi</b>, <i>cek</i> <s>lama</s> a_b 2*3</p><ul><li>satu</li><li>dua</li></ul>"
 		'<h3>Judul</h3><p><a href="https://x.id/a">link</a> <a href="https://x.id">https://x.id</a></p>'
 	)
 	assert text == "Halo *Budi*, _cek_ ~lama~ a_b 2*3\n\n• satu\n• dua\n\n*Judul*\n\nlink (https://x.id/a) https://x.id", repr(text)
+
+	# the helpdesk Reply button's quote is not sent back to the customer
+	text, *_ = helpdesk.split_inline_images('<p>oke kak</p><p class="reply-to-content"></p><blockquote><p>pesan lama</p></blockquote>')
+	assert text == "oke kak", repr(text)
 
 	# a contact saved as 0812-... is found for 62812...
 	number = f"62997{random.randint(1000000, 9999999)}"
@@ -308,6 +312,33 @@ def _check_evolution():
 			evolution.save_incoming(account, evo_msg("E12", {"conversation": "masih ada orang?"}))
 		assert [b["text"] for p, b in calls if "sendText" in p] == [note], calls
 		assert frappe.db.get_value("WhatsApp Message", {"message_id": "E12"}, "reference_name") == third
+
+		# 6f. customer quotes a message: the ticket shows what they replied to
+		quoted_id = frappe.db.get_value("WhatsApp Message", {"type": "Outgoing", "to": number, "message": note}, "message_id")
+		reply = lambda mid, text, quoted: {"extendedTextMessage": {"text": text, "contextInfo": {"stanzaId": quoted, "quotedMessage": {"conversation": "dari HP"}}}}
+		evolution.save_incoming(account, evo_msg("E13", reply("E13", "jam berapa?", quoted_id)))
+		evolution.save_incoming(account, evo_msg("E14", reply("E14", "yang ini", "UNKNOWN-ID")))  # sent from the phone
+		latest = frappe.get_all("Communication", {"reference_name": third, "sent_or_received": "Received"}, pluck="content", order_by="creation desc", limit=2)
+		assert "Membalas:</i> " + helpdesk.OFF_HOURS_PREFIX in latest[1] and "jam berapa?" in latest[1], latest
+		assert "Membalas:</i> dari HP" in latest[0] and "yang ini" in latest[0], latest
+
+		# 6g. agent uses Reply on the "jam berapa?" row -> WhatsApp reply quoting E13, quote not sent as text
+		def agent_reply(html):
+			comm = frappe.get_doc(
+				{"doctype": "Communication", "communication_type": "Communication", "communication_medium": "",
+				 "sent_or_received": "Sent", "content": html, "reference_doctype": "HD Ticket", "reference_name": third, "subject": "Re"}
+			).insert(ignore_permissions=True)
+			calls.clear()
+			with patch.object(frappe.db, "commit"), patch.object(frappe.db, "rollback"):
+				helpdesk.send_reply(comm.name, number)
+			return calls[0][1]
+
+		# the editor re-renders the stored HTML, so whitespace differs
+		rendered = latest[1].replace("<br>", "<br/>\n  ")
+		body = agent_reply(f'<p>Jam 10 kak</p><p class="reply-to-content"></p><blockquote>{rendered}</blockquote>')
+		assert body["text"] == "Jam 10 kak" and body["quoted"] == {"key": {"id": "E13"}}, body
+		body = agent_reply('<p>Oke</p><p class="reply-to-content"></p><blockquote><p>tidak ada di ticket</p></blockquote>')
+		assert body["text"] == "Oke" and "quoted" not in body, body
 
 		# 6d. agent resolves -> one closing message; Resolved -> Closed sends no second one
 		calls.clear()

@@ -9,7 +9,7 @@ import mimetypes
 from urllib.parse import unquote
 
 import frappe
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 from frappe.utils import add_to_date, escape_html, get_datetime, now_datetime
 from markdownify import MarkdownConverter, abstract_inline_conversion
@@ -323,6 +323,17 @@ def get_or_create_contact(number, name):
 	return contact.name
 
 
+def quoted_text(msg):
+	"""Text of the message the customer replied to, if any."""
+	if not (msg.get("is_reply") and msg.get("reply_to_message_id")):
+		return None
+	row = frappe.db.get_value(
+		"WhatsApp Message", {"message_id": msg.reply_to_message_id}, ["message", "content_type"], as_dict=True
+	)
+	text = (row and (row.message or f"[{row.content_type}]")) or msg.flags.get("quoted_text") or "[pesan sebelumnya]"
+	return text if len(text) <= 300 else text[:300] + "…"
+
+
 def find_contact(number):
 	"""Existing contact whose phone matches however it was typed: 62812.., +62 812-.., 0812.."""
 	# shortcut: only Indonesia's 0 trunk prefix is mapped; add other country codes if customers come from abroad
@@ -342,6 +353,9 @@ def link_message(msg, ticket, log=True):
 		return  # menu taps are routing info, not conversation
 
 	content = escape_html(msg.message or "").replace("\n", "<br>")
+	quote = quoted_text(msg)
+	if quote:
+		content = f"<blockquote>↪ <i>Membalas:</i> {escape_html(quote)}</blockquote>" + content
 	if msg.attach:
 		if msg.content_type == "image":
 			content += f'<p><img src="{msg.attach}"></p>'
@@ -359,6 +373,7 @@ def link_message(msg, ticket, log=True):
 			"content": content or "-",
 			"sender_full_name": msg.profile_name or msg.get("from"),
 			"phone_no": msg.get("from"),
+			"message_id": msg.message_id,  # lets an agent's Reply on this row quote it on WhatsApp
 			"reference_doctype": "HD Ticket",
 			"reference_name": ticket,
 		}
@@ -443,7 +458,7 @@ def send_reply(communication, number):
 	account = ticket_account(comm.reference_name)
 
 	outgoing = []
-	text, inline_urls = split_inline_images(comm.content or "")
+	text, inline_urls, quote = split_inline_images(comm.content or "")
 	if text:
 		outgoing.append({"content_type": "text", "message": text})
 	files = frappe.get_all(
@@ -454,6 +469,11 @@ def send_reply(communication, number):
 	for url in dict.fromkeys(inline_urls + files):  # an inline image may also be attached
 		outgoing.append({"content_type": media_type(url), "attach": url})
 
+	quoted_id = quote and quoted_message_id(comm.reference_name, quote)
+	if quoted_id and outgoing:
+		# the first message carries the WhatsApp reply, like a person replying then sending files
+		outgoing[0].update(is_reply=1, reply_to_message_id=quoted_id)
+
 	for payload in outgoing:
 		send_to_customer(comm.reference_name, number, account, payload)
 
@@ -461,13 +481,41 @@ def send_reply(communication, number):
 def split_inline_images(html):
 	"""(plain text, site file urls) — images pasted into the editor are sent as media, not markdown."""
 	soup = BeautifulSoup(html, "html.parser")
+	# the agent's Reply button appends the quoted message: send it as a WhatsApp reply, not as text
+	quote = None
+	for marker in soup.select("p.reply-to-content"):
+		block = marker.find_next_sibling("blockquote")
+		if block:
+			quote = quote or plain(block)
+			block.decompose()
+		marker.decompose()
 	urls = []
 	for img in soup.find_all("img"):
 		src = unquote(img.get("src") or "")
 		if src.startswith(("/files/", "/private/files/")) and frappe.db.exists("File", {"file_url": src}):
 			urls.append(src)
 		img.decompose()
-	return WhatsAppConverter().convert(str(soup)).strip(), urls
+	return WhatsAppConverter().convert(str(soup)).strip(), urls, quote
+
+
+def plain(html):
+	"""Whitespace-normalised text, so the editor's re-rendered quote matches the stored HTML."""
+	soup = html if isinstance(html, Tag) else BeautifulSoup(html or "", "html.parser")
+	return " ".join(soup.get_text(" ").split())
+
+
+def quoted_message_id(ticket, quote):
+	"""WhatsApp id of the customer message the agent quoted; the newest one if the text repeats."""
+	for content, message_id in frappe.get_all(
+		"Communication",
+		{"reference_doctype": "HD Ticket", "reference_name": ticket, "sent_or_received": "Received", "message_id": ["is", "set"]},
+		["content", "message_id"],
+		order_by="creation desc",
+		as_list=True,
+	):
+		if plain(content) == quote:
+			return message_id
+	return None
 
 
 class WhatsAppConverter(MarkdownConverter):
