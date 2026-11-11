@@ -18,6 +18,11 @@ TEAM_PREFIX = "hd_team:"
 MEDIA_TYPES = ("image", "audio", "video", "document")
 OPEN_CATEGORIES = ("Open", "Paused")
 MENU_TEXT = "Halo! Silakan pilih divisi yang ingin Anda hubungi:"
+CONFIRM_TEXT = (
+	"Terima kasih, Anda sudah terhubung dengan tim *{team}*. "
+	"Silakan sampaikan pertanyaan Anda, tim kami akan segera membalas."
+)
+CONFIRM_TEXT_NO_TEAM = "Terima kasih, pesan Anda sudah kami terima. Tim kami akan segera membalas."
 MENU_COOLDOWN_MINUTES = 30  # don't resend the menu for every message while the customer decides
 PENDING_WINDOW_HOURS = 24  # unlinked messages older than this are not pulled into a new ticket
 
@@ -92,6 +97,29 @@ def route_message(msg):
 	for pending in pending_messages(number):
 		# the choice itself is routing info, not conversation
 		link_message(pending, ticket, log=pending.name != msg.name)
+	send_confirmation(msg, ticket, choice)
+
+
+def send_confirmation(msg, ticket, team):
+	text = (CONFIRM_TEXT if team else CONFIRM_TEXT_NO_TEAM).format(team=team, ticket=ticket)
+	frappe.db.savepoint("wa_confirm")
+	try:
+		frappe.get_doc(
+			{
+				"doctype": "WhatsApp Message",
+				"type": "Outgoing",
+				"to": msg.get("from"),
+				"content_type": "text",
+				"message": text,
+				"whatsapp_account": msg.whatsapp_account,
+				"reference_doctype": "HD Ticket",
+				"reference_name": ticket,
+			}
+		).insert(ignore_permissions=True)
+	except Exception:
+		# the ticket must survive a gateway hiccup; the confirmation is a courtesy
+		frappe.db.rollback(save_point="wa_confirm")
+		frappe.log_error("WhatsApp confirmation not sent", reference_doctype="HD Ticket", reference_name=ticket)
 
 
 def team_choice(msg, teams):
@@ -111,14 +139,7 @@ def team_choice(msg, teams):
 
 
 def last_menu(number):
-	if not menu_sent_within(number, PENDING_WINDOW_HOURS * 60):
-		return []
-	buttons = frappe.db.get_value(
-		"WhatsApp Message",
-		{"type": "Outgoing", "to": number, "content_type": "interactive"},
-		"buttons",
-		order_by="creation desc",
-	)
+	buttons = frappe.db.get_value("WhatsApp Message", unused_menu_filters(number, PENDING_WINDOW_HOURS * 60), "buttons", order_by="creation desc")
 	return json.loads(buttons or "[]")
 
 
@@ -130,15 +151,16 @@ def looks_like_choice(msg):
 
 
 def menu_sent_within(number, minutes):
-	return frappe.db.exists(
-		"WhatsApp Message",
-		{
-			"type": "Outgoing",
-			"to": number,
-			"content_type": "interactive",
-			"creation": [">", add_to_date(now_datetime(), minutes=-minutes)],
-		},
-	)
+	return frappe.db.exists("WhatsApp Message", unused_menu_filters(number, minutes))
+
+
+def unused_menu_filters(number, minutes):
+	"""Menus sent in the last `minutes` and after the latest ticket: older ones were already answered."""
+	since = add_to_date(now_datetime(), minutes=-minutes)
+	last_ticket = frappe.db.get_value("HD Ticket", {"whatsapp_number": number}, "creation", order_by="creation desc")
+	if last_ticket and last_ticket > since:
+		since = last_ticket
+	return {"type": "Outgoing", "to": number, "content_type": "interactive", "creation": [">", since]}
 
 
 def open_ticket(number):

@@ -92,6 +92,8 @@ def _check_flow(sent):
 	t = frappe.get_doc("HD Ticket", ticket)
 	assert t.agent_group == team, t.agent_group
 	assert t.raised_by == f"{number}@whatsapp.invalid", t.raised_by  # fills the reply box's To
+	confirm = [d for d in sent if d.get("type") == "text" and d["to"] == number]
+	assert len(confirm) == 1 and f"tim *{team}*." in confirm[0]["text"]["body"] and "(" not in confirm[0]["text"]["body"], sent
 	assert t.subject == "Pesanan saya belum sampai", t.subject
 	assert t.contact
 	received = frappe.get_all("Communication", {"reference_name": ticket, "sent_or_received": "Received"}, pluck="content", order_by="creation asc")
@@ -199,6 +201,8 @@ def _check_evolution():
 			evolution.save_incoming(account, evo_msg("E3", {"extendedTextMessage": {"text": "2"}}))
 		ticket = helpdesk.open_ticket(number)
 		assert ticket and frappe.db.get_value("HD Ticket", ticket, "agent_group") == team
+		confirm = calls[-1]
+		assert confirm[0].startswith("/message/sendText/") and f"tim *{team}*." in confirm[1]["text"], calls
 		assert frappe.db.get_value("HD Ticket", ticket, "subject") == "Mesin kasir error"
 		received = frappe.get_all("Communication", {"reference_name": ticket, "sent_or_received": "Received"}, pluck="content")
 		assert "2" not in received and any("kasir" in c for c in received), received
@@ -234,6 +238,16 @@ def _check_evolution():
 		media = calls[2][1]
 		assert calls[2][0].startswith("/message/sendMedia/") and media["mediatype"] == "document", calls
 		assert media["fileName"] == "selfcheck-evo.txt" and base64.b64decode(media["media"]) == b"nota"
+
+		# 6b. ticket resolved, customer writes again within the menu cooldown -> fresh menu, then a new ticket
+		frappe.db.set_value("HD Ticket", ticket, {"status": "Resolved", "status_category": "Resolved"})
+		calls.clear()
+		evolution.save_incoming(account, evo_msg("E7", {"conversation": "halo lagi"}))
+		assert calls and f"2. {team}" in calls[-1][1]["text"], calls
+		evolution.save_incoming(account, evo_msg("E8", {"conversation": "2"}))
+		new_ticket = helpdesk.open_ticket(number)
+		assert new_ticket and new_ticket != ticket, (new_ticket, ticket)
+		assert frappe.db.get_value("HD Ticket", new_ticket, "subject") == "halo lagi"
 
 	# 7. webhook token: right token for the instance passes, wrong one is refused
 	with patch("frappe_whatsapp.utils.evolution.frappe.get_request_header", lambda h: "evo-secret"):
