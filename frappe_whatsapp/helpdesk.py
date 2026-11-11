@@ -14,27 +14,13 @@ from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 from frappe.utils import add_to_date, escape_html, get_datetime, now_datetime
 from markdownify import MarkdownConverter, abstract_inline_conversion
 
+from frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_helpdesk_settings import whatsapp_helpdesk_settings as settings
+
 TEAM_PREFIX = "hd_team:"
 MEDIA_TYPES = ("image", "audio", "video", "document")
 OPEN_CATEGORIES = ("Open", "Paused")
-MENU_TEXT = "Halo! Silakan pilih divisi yang ingin Anda hubungi:"
-CONFIRM_TEXT = (
-	"Terima kasih, Anda sudah terhubung dengan tim *{team}*. "
-	"Silakan sampaikan pertanyaan Anda, tim kami akan segera membalas. "
-	"Ketik *menu* jika ingin pindah ke divisi lain."
-)
-MENU_KEYWORDS = ("menu",)  # not "0": a customer may answer an agent's question with 0
-CLOSED_TEXT = (
-	"Percakapan Anda dengan tim *{team}* sudah selesai. Terima kasih! "
-	"Jika ada pertanyaan lain, silakan kirim pesan kembali."
-)
-CLOSED_TEXT_NO_TEAM = "Percakapan Anda sudah selesai. Terima kasih! Jika ada pertanyaan lain, silakan kirim pesan kembali."
-CONFIRM_TEXT_NO_TEAM = "Terima kasih, pesan Anda sudah kami terima. Tim kami akan segera membalas."
-OFF_HOURS_PREFIX = "Saat ini di luar jam kerja kami."
-OFF_HOURS_NOTE_HOURS = 12  # shortcut: one note per 12h, not per closed period; enough for overnight/weekend
 HARI = ("Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu")
 BULAN = ("Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember")
-MENU_COOLDOWN_MINUTES = 30  # don't resend the menu for every message while the customer decides
 PENDING_WINDOW_HOURS = 24  # unlinked messages older than this are not pulled into a new ticket
 
 
@@ -118,7 +104,7 @@ def route_message(msg):
 
 
 def is_menu_keyword(msg):
-	return msg.content_type == "text" and (msg.message or "").strip().lower() in MENU_KEYWORDS
+	return msg.content_type == "text" and (msg.message or "").strip().lower() in settings.menu_keywords()
 
 
 def close_for_switch(ticket):
@@ -131,20 +117,22 @@ def close_for_switch(ticket):
 
 
 def send_confirmation(msg, ticket, team):
-	text = (CONFIRM_TEXT if team else CONFIRM_TEXT_NO_TEAM).format(team=team, ticket=ticket)
+	text = settings.get("confirm_text").format(team=team) if team else settings.get("confirm_text_no_team")
 	note = off_hours_note(frappe.db.get_value("HD Ticket", ticket, "sla"))
 	send_courtesy(msg, ticket, f"{text}\n\n{note}" if note else text)
 
 
 def maybe_send_off_hours_note(msg, ticket):
-	"""Message on an open ticket outside working hours: say when we answer, at most once per OFF_HOURS_NOTE_HOURS."""
+	"""Message on an open ticket outside working hours: say when we answer, at most once per off_hours_note_hours."""
 	note = off_hours_note(frappe.db.get_value("HD Ticket", ticket, "sla"))
 	if not note:
 		return
-	since = add_to_date(now_datetime(), hours=-OFF_HOURS_NOTE_HOURS)
+	# shortcut: one note per N hours, not per closed period; enough for overnight/weekend
+	since = add_to_date(now_datetime(), hours=-int(settings.get("off_hours_note_hours")))
 	already = frappe.db.exists(
 		"WhatsApp Message",
-		{"type": "Outgoing", "to": msg.get("from"), "message": ["like", f"%{OFF_HOURS_PREFIX}%"], "creation": [">", since]},
+		# same opening time = same closed period; the note may also sit inside a confirmation
+		{"type": "Outgoing", "to": msg.get("from"), "message": ["like", f"%{note}%"], "creation": [">", since]},
 	)
 	if not already:
 		send_courtesy(msg, ticket, note)
@@ -172,7 +160,7 @@ def off_hours_note(sla_name=None, now=None):
 	if not opens:
 		return None
 	when = f"{HARI[opens.weekday()]}, {opens.day} {BULAN[opens.month - 1]} pukul {opens:%H.%M}"
-	return f"{OFF_HOURS_PREFIX} Pesan Anda sudah kami terima dan akan dibalas mulai {when}."
+	return settings.get("off_hours_text").format(opens=when)
 
 
 def send_courtesy(msg, ticket, text):
@@ -267,7 +255,7 @@ def pending_messages(number):
 
 def send_team_menu(msg, teams, force=False):
 	number = msg.get("from")
-	if not force and menu_sent_within(number, MENU_COOLDOWN_MINUTES):
+	if not force and menu_sent_within(number, int(settings.get("menu_cooldown_minutes"))):
 		return
 	frappe.get_doc(
 		{
@@ -275,7 +263,7 @@ def send_team_menu(msg, teams, force=False):
 			"type": "Outgoing",
 			"to": number,
 			"content_type": "interactive",
-			"message": MENU_TEXT,
+			"message": settings.get("menu_text"),
 			# WhatsApp caps list rows at 10 and button titles at 20 chars
 			"buttons": json.dumps([{"id": TEAM_PREFIX + t, "title": t[:20]} for t in teams[:10]]),
 			"whatsapp_account": msg.whatsapp_account,
@@ -416,7 +404,7 @@ def on_ticket_update(doc, method=None):
 
 def send_closing_message(ticket):
 	number, team = frappe.db.get_value("HD Ticket", ticket, ["whatsapp_number", "agent_group"])
-	text = (CLOSED_TEXT if team else CLOSED_TEXT_NO_TEAM).format(team=team)
+	text = settings.get("closed_text").format(team=team) if team else settings.get("closed_text_no_team")
 	send_to_customer(ticket, number, ticket_account(ticket), {"content_type": "text", "message": text}, "pesan penutup")
 
 

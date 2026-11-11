@@ -1,0 +1,130 @@
+{
+ "actions": [],
+ "creation": "2026-11-11 15:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "menu_section",
+  "menu_text",
+  "menu_footer",
+  "menu_keywords",
+  "menu_cooldown_minutes",
+  "confirm_section",
+  "confirm_text",
+  "confirm_text_no_team",
+  "closed_text",
+  "closed_text_no_team",
+  "off_hours_section",
+  "off_hours_text",
+  "off_hours_note_hours"
+ ],
+ "fields": [
+  {
+   "fieldname": "menu_section",
+   "fieldtype": "Section Break",
+   "label": "Menu Divisi"
+  },
+  {
+   "fieldname": "menu_text",
+   "fieldtype": "Small Text",
+   "label": "Teks Menu",
+   "default": "Halo! Silakan pilih divisi yang ingin Anda hubungi:",
+   "description": "Daftar divisi ditambahkan di bawah teks ini."
+  },
+  {
+   "fieldname": "menu_footer",
+   "fieldtype": "Data",
+   "label": "Penutup Menu",
+   "default": "Balas dengan angka pilihan Anda.",
+   "description": "Hanya untuk Evolution API: baris di bawah daftar bernomor."
+  },
+  {
+   "fieldname": "menu_keywords",
+   "fieldtype": "Data",
+   "label": "Kata Kunci Ganti Divisi",
+   "default": "menu",
+   "description": "Pisahkan dengan koma. Pesan yang persis sama dengan kata ini menutup ticket dan mengirim menu lagi."
+  },
+  {
+   "fieldname": "menu_cooldown_minutes",
+   "fieldtype": "Int",
+   "label": "Jeda Kirim Ulang Menu (menit)",
+   "default": "30"
+  },
+  {
+   "fieldname": "confirm_section",
+   "fieldtype": "Section Break",
+   "label": "Konfirmasi dan Penutup"
+  },
+  {
+   "fieldname": "confirm_text",
+   "fieldtype": "Small Text",
+   "label": "Konfirmasi Tim",
+   "default": "Terima kasih, Anda sudah terhubung dengan tim *{team}*. Silakan sampaikan pertanyaan Anda, tim kami akan segera membalas. Ketik *menu* jika ingin pindah ke divisi lain.",
+   "description": "Dikirim setelah pelanggan memilih divisi. {team} = nama divisi."
+  },
+  {
+   "fieldname": "confirm_text_no_team",
+   "fieldtype": "Small Text",
+   "label": "Konfirmasi Tanpa Tim",
+   "default": "Terima kasih, pesan Anda sudah kami terima. Tim kami akan segera membalas.",
+   "description": "Dipakai jika belum ada divisi aktif."
+  },
+  {
+   "fieldname": "closed_text",
+   "fieldtype": "Small Text",
+   "label": "Pesan Ticket Selesai",
+   "default": "Percakapan Anda dengan tim *{team}* sudah selesai. Terima kasih! Jika ada pertanyaan lain, silakan kirim pesan kembali.",
+   "description": "Dikirim saat ticket Resolved/Closed. {team} = nama divisi."
+  },
+  {
+   "fieldname": "closed_text_no_team",
+   "fieldtype": "Small Text",
+   "label": "Pesan Ticket Selesai Tanpa Tim",
+   "default": "Percakapan Anda sudah selesai. Terima kasih! Jika ada pertanyaan lain, silakan kirim pesan kembali."
+  },
+  {
+   "fieldname": "off_hours_section",
+   "fieldtype": "Section Break",
+   "label": "Di Luar Jam Kerja",
+   "description": "Jam kerja diambil dari SLA ticket di Helpdesk."
+  },
+  {
+   "fieldname": "off_hours_text",
+   "fieldtype": "Small Text",
+   "label": "Pemberitahuan Di Luar Jam Kerja",
+   "default": "Saat ini di luar jam kerja kami. Pesan Anda sudah kami terima dan akan dibalas mulai {opens}.",
+   "description": "{opens} = waktu buka berikutnya, contoh: Senin, 16 November pukul 10.00."
+  },
+  {
+   "fieldname": "off_hours_note_hours",
+   "fieldtype": "Int",
+   "label": "Jeda Pemberitahuan (jam)",
+   "default": "12",
+   "description": "Pesan di ticket yang terbuka mendapat pemberitahuan paling banyak sekali dalam jangka ini."
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-11-11 15:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Frappe Whatsapp",
+ "name": "WhatsApp Helpdesk Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

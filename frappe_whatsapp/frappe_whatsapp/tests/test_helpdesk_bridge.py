@@ -31,6 +31,7 @@ def run():
 			# routing swallows errors into Error Log; surface them here
 			patch.object(helpdesk.frappe, "log_error", _reraise),
 		):
+			_check_settings()
 			_check_format_and_contact()
 			_check_off_hours()
 			# flows below must not depend on the clock
@@ -159,6 +160,30 @@ def _check_format_and_contact():
 	assert helpdesk.find_contact("1" + number) is None
 
 
+def _check_settings():
+	s = helpdesk.settings
+	doc = frappe.get_single(s.DOCTYPE)
+	# edited texts are used; keywords are a comma list
+	doc.confirm_text, doc.menu_keywords = "Oke, tim {team} siap!", "Menu, ganti "
+	doc.save(ignore_permissions=True)
+	assert s.get("confirm_text").format(team="IT") == "Oke, tim IT siap!"
+	assert s.menu_keywords() == {"menu", "ganti"}, s.menu_keywords()
+	# an unknown placeholder is refused at save, not at send time
+	for bad in ("Halo {nama}", "Kurung {team"):
+		doc.confirm_text = bad
+		try:
+			doc.save(ignore_permissions=True)
+		except frappe.ValidationError:
+			pass
+		else:
+			raise AssertionError(f"accepted {bad!r}")
+	# cleared fields fall back to the defaults
+	doc.reload()
+	doc.confirm_text = doc.menu_keywords = ""
+	doc.save(ignore_permissions=True)
+	assert s.get("confirm_text") == s.DEFAULTS["confirm_text"] and s.menu_keywords() == {"menu"}
+
+
 def _check_off_hours():
 	from datetime import datetime, timedelta
 
@@ -170,7 +195,7 @@ def _check_off_hours():
 		assert note(11, 12, 0) is None  # Wednesday noon
 		assert note(11, 8, 0).endswith("mulai Rabu, 11 November pukul 10.00."), note(11, 8, 0)
 		assert note(13, 19, 30).endswith("mulai Senin, 16 November pukul 10.00."), note(13, 19, 30)
-		assert note(14, 12, 0).startswith(helpdesk.OFF_HOURS_PREFIX) and "Senin, 16 November" in note(14, 12, 0)
+		assert note(14, 12, 0).startswith("Saat ini di luar jam kerja kami.") and "Senin, 16 November" in note(14, 12, 0)
 
 
 def _check_signature():
@@ -306,7 +331,7 @@ def _check_evolution():
 
 		# 6e. off hours: messages on the open ticket get one note, not one per message
 		calls.clear()
-		note = helpdesk.OFF_HOURS_PREFIX + " Pesan Anda sudah kami terima dan akan dibalas mulai Senin."
+		note = helpdesk.settings.get("off_hours_text").format(opens="Senin")
 		with patch.object(helpdesk, "off_hours_note", lambda *a, **k: note):
 			evolution.save_incoming(account, evo_msg("E11", {"conversation": "malam kak"}))
 			evolution.save_incoming(account, evo_msg("E12", {"conversation": "masih ada orang?"}))
@@ -319,7 +344,7 @@ def _check_evolution():
 		evolution.save_incoming(account, evo_msg("E13", reply("E13", "jam berapa?", quoted_id)))
 		evolution.save_incoming(account, evo_msg("E14", reply("E14", "yang ini", "UNKNOWN-ID")))  # sent from the phone
 		latest = frappe.get_all("Communication", {"reference_name": third, "sent_or_received": "Received"}, pluck="content", order_by="creation desc", limit=2)
-		assert "Membalas:</i> " + helpdesk.OFF_HOURS_PREFIX in latest[1] and "jam berapa?" in latest[1], latest
+		assert "Membalas:</i> Saat ini di luar jam kerja" in latest[1] and "jam berapa?" in latest[1], latest
 		assert "Membalas:</i> dari HP" in latest[0] and "yang ini" in latest[0], latest
 
 		# 6g. agent uses Reply on the "jam berapa?" row -> WhatsApp reply quoting E13, quote not sent as text
@@ -349,7 +374,7 @@ def _check_evolution():
 				t3.status = status
 				t3.save(ignore_permissions=True)
 		texts = [b["text"] for p, b in calls if "sendText" in p]
-		assert texts == [helpdesk.CLOSED_TEXT.format(team=team)], calls
+		assert texts == [helpdesk.settings.get("closed_text").format(team=team)], calls
 
 	# 7. webhook token: right token for the instance passes, wrong one is refused
 	with patch("frappe_whatsapp.utils.evolution.frappe.get_request_header", lambda h: "evo-secret"):

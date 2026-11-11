@@ -15,6 +15,7 @@ import requests
 from frappe import _
 
 from frappe_whatsapp.utils import format_number
+from frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_helpdesk_settings import whatsapp_helpdesk_settings as settings
 
 PROVIDER = "Evolution API"
 WEBHOOK_PATH = "/api/method/frappe_whatsapp.utils.evolution.webhook"
@@ -91,7 +92,7 @@ def send(msg):
 def numbered_menu(msg):
 	options = json.loads(msg.buttons) if isinstance(msg.buttons, str) else (msg.buttons or [])
 	lines = [f"{i}. {opt['title']}" for i, opt in enumerate(options, 1)]
-	return "\n".join([msg.message or "", "", *lines, "", "Balas dengan angka pilihan Anda."]).strip()
+	return "\n".join([msg.message or "", "", *lines, "", settings.get("menu_footer")]).strip()
 
 
 def media_source(attach):
