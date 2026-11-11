@@ -122,9 +122,9 @@ class WhatsAppMessage(Document):
                         "type": "list",
                         "body": {"text": self.message},
                         "action": {
-                            "button": "Select Option",
+                            "button": "Pilih Divisi",
                             "sections": [{
-                                "title": "Options",
+                                "title": "Divisi",
                                 "rows": [
                                     {"id": btn["id"], "title": btn["title"], "description": btn.get("description", "")}
                                     for btn in buttons_data[:10]

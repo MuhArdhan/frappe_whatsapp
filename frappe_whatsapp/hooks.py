@@ -115,6 +115,9 @@ app_include_js = "/assets/frappe_whatsapp/js/frappe_whatsapp.js"
 # ---------------
 
 scheduler_events = {
+    "cron": {
+        "*/10 * * * *": ["frappe_whatsapp.utils.evolution.check_connections"],
+    },
     "all": [
         "frappe_whatsapp.utils.trigger_whatsapp_notifications_all",
         "frappe_whatsapp.utils.bulk_messaging.process_scheduled_bulk_messages"
@@ -222,6 +225,7 @@ doc_events = {
     # Helpdesk bridge (no-ops on sites without helpdesk)
     "WhatsApp Message": {"on_update": "frappe_whatsapp.helpdesk.on_whatsapp_message"},
     "Communication": {"after_insert": "frappe_whatsapp.helpdesk.on_communication"},
+    "HD Ticket": {"on_update": "frappe_whatsapp.helpdesk.on_ticket_update"},
     # Department -> HD Team sync (no-ops without helpdesk + erpnext)
     "Employee": {
         "on_update": "frappe_whatsapp.helpdesk_departments.queue_sync",

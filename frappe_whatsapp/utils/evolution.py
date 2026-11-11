@@ -144,6 +144,43 @@ def connect(account):
 	return {"state": state, "qr": qr.get("base64")}
 
 
+def check_connections():
+	"""Scheduler: tell whoever set the account up when its number goes offline, once per outage."""
+	for name in frappe.get_all("WhatsApp Account", {"provider": PROVIDER, "status": "Active"}, pluck="name"):
+		account = frappe.get_doc("WhatsApp Account", name)
+		try:
+			state = (api(account, "GET", f"/instance/connectionState/{account.evolution_instance}").get("instance") or {}).get("state")
+		except Exception as e:
+			state = str(e)[:200] or type(e).__name__
+		key = f"wa_evolution_down:{name}"
+		was_down = frappe.cache.get_value(key)
+		frappe.cache.set_value(key, state != "open")
+		if state != "open" and not was_down:
+			notify_down(account, state)
+
+
+def notify_down(account, state):
+	subject = f"WhatsApp {account.name} terputus: {state}"
+	body = "Pesan pelanggan tidak masuk sampai tersambung lagi. Buka WhatsApp Account lalu klik Connect WhatsApp (QR)."
+	for user in alert_recipients(account):
+		frappe.get_doc(
+			{
+				"doctype": "Notification Log",
+				"for_user": user,
+				"type": "Alert",
+				"document_type": "WhatsApp Account",
+				"document_name": account.name,
+				"subject": subject,
+				"email_content": body,
+			}
+		).insert(ignore_permissions=True)
+
+
+def alert_recipients(account):
+	# System Manager is often handed out widely (cashiers etc.); the account's admins are the ones who can rescan
+	return {u for u in (account.owner, account.modified_by) if u and u != "Guest"}
+
+
 # ---------------------------------------------------------------- incoming
 
 

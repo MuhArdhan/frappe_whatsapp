@@ -20,9 +20,16 @@ OPEN_CATEGORIES = ("Open", "Paused")
 MENU_TEXT = "Halo! Silakan pilih divisi yang ingin Anda hubungi:"
 CONFIRM_TEXT = (
 	"Terima kasih, Anda sudah terhubung dengan tim *{team}*. "
-	"Silakan sampaikan pertanyaan Anda, tim kami akan segera membalas."
+	"Silakan sampaikan pertanyaan Anda, tim kami akan segera membalas. "
+	"Ketik *menu* jika ingin pindah ke divisi lain."
 )
-CONFIRM_TEXT_NO_TEAM = "Terima kasih, pesan Anda sudah kami terima. Tim kami akan segera membalas."
+MENU_KEYWORDS = ("menu",)  # not "0": a customer may answer an agent's question with 0
+CLOSED_TEXT = (
+	"Percakapan Anda dengan tim *{team}* sudah selesai. Terima kasih! "
+	"Jika ada pertanyaan lain, silakan kirim pesan kembali."
+)
+CLOSED_TEXT_NO_TEAM = "Percakapan Anda sudah selesai. Terima kasih! Jika ada pertanyaan lain, silakan kirim pesan kembali."
+CONFIRM_TEXT_NO_TEAM ="Terima kasih, pesan Anda sudah kami terima. Tim kami akan segera membalas."
 MENU_COOLDOWN_MINUTES = 30  # don't resend the menu for every message while the customer decides
 PENDING_WINDOW_HOURS = 24  # unlinked messages older than this are not pulled into a new ticket
 
@@ -82,6 +89,11 @@ def route_message(msg):
 	number = msg.get("from")
 
 	ticket = open_ticket(number)
+	wants_menu = is_menu_keyword(msg)
+	if ticket and wants_menu:
+		link_message(msg, ticket)
+		close_for_switch(ticket)
+		ticket = None
 	if ticket:
 		link_message(msg, ticket)
 		return
@@ -89,15 +101,28 @@ def route_message(msg):
 	teams = active_teams()
 	choice = team_choice(msg, teams)
 	if teams and not choice:
-		# a stale/unknown choice gets the menu again right away
-		send_team_menu(msg, teams, force=looks_like_choice(msg))
+		# a stale/unknown choice or the menu keyword gets the menu again right away
+		send_team_menu(msg, teams, force=wants_menu or looks_like_choice(msg))
 		return
 
 	ticket = create_ticket(msg, choice)
 	for pending in pending_messages(number):
-		# the choice itself is routing info, not conversation
-		link_message(pending, ticket, log=pending.name != msg.name)
+		# the choice and the menu keyword are routing info, not conversation
+		link_message(pending, ticket, log=pending.name != msg.name and not is_menu_keyword(pending))
 	send_confirmation(msg, ticket, choice)
+
+
+def is_menu_keyword(msg):
+	return msg.content_type == "text" and (msg.message or "").strip().lower() in MENU_KEYWORDS
+
+
+def close_for_switch(ticket):
+	"""Customer wants another team: close this ticket, the next choice opens a new one."""
+	doc = frappe.get_doc("HD Ticket", ticket)
+	doc.status = "Closed"
+	doc.flags.wa_menu_switch = True  # the customer gets the menu, not a goodbye
+	doc.save(ignore_permissions=True)
+	doc.add_comment("Info", "Pelanggan mengetik menu untuk pindah divisi, percakapan berlanjut di ticket baru.")
 
 
 def send_confirmation(msg, ticket, team):
@@ -213,7 +238,11 @@ def create_ticket(msg, team):
 	number = msg.get("from")
 	name = msg.profile_name or number
 	first_text = next(
-		(m.message for m in pending_messages(number) if m.content_type == "text" and m.message and m.name != msg.name),
+		(
+			m.message
+			for m in pending_messages(number)
+			if m.content_type == "text" and m.message and m.name != msg.name and not is_menu_keyword(m)
+		),
 		None,
 	)
 	ticket = frappe.get_doc(
@@ -298,14 +327,59 @@ def on_communication(doc, method=None):
 		frappe.enqueue(send_reply, communication=doc.name, number=number, enqueue_after_commit=True)
 
 
-def send_reply(communication, number):
-	comm = frappe.get_doc("Communication", communication)
-	account = frappe.db.get_value(
+def on_ticket_update(doc, method=None):
+	"""HD Ticket on_update: tell the customer when their WhatsApp ticket is resolved or closed."""
+	if (
+		doc.get("whatsapp_number")
+		and doc.has_value_changed("status_category")
+		and doc.status_category == "Resolved"
+		and not doc.flags.wa_menu_switch
+	):
+		frappe.enqueue(send_closing_message, ticket=doc.name, enqueue_after_commit=True)
+
+
+def send_closing_message(ticket):
+	number, team = frappe.db.get_value("HD Ticket", ticket, ["whatsapp_number", "agent_group"])
+	text = (CLOSED_TEXT if team else CLOSED_TEXT_NO_TEAM).format(team=team)
+	send_to_customer(ticket, number, ticket_account(ticket), {"content_type": "text", "message": text}, "pesan penutup")
+
+
+def ticket_account(ticket):
+	return frappe.db.get_value(
 		"WhatsApp Message",
-		{"reference_doctype": "HD Ticket", "reference_name": comm.reference_name, "type": "Incoming"},
+		{"reference_doctype": "HD Ticket", "reference_name": ticket, "type": "Incoming"},
 		"whatsapp_account",
 		order_by="creation desc",
 	)
+
+
+def send_to_customer(ticket, number, account, payload, what="balasan"):
+	"""Send one message in its own transaction; a failure becomes a comment on the ticket."""
+	try:
+		frappe.get_doc(
+			{
+				"doctype": "WhatsApp Message",
+				"type": "Outgoing",
+				"to": number,
+				"whatsapp_account": account,
+				"reference_doctype": "HD Ticket",
+				"reference_name": ticket,
+				**payload,
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.commit()
+	except Exception as e:
+		frappe.db.rollback()
+		frappe.log_error("Helpdesk -> WhatsApp send failed", reference_doctype="HD Ticket", reference_name=ticket)
+		frappe.get_doc("HD Ticket", ticket).add_comment(
+			"Comment", f"Gagal mengirim {what} ke WhatsApp: {escape_html(str(e))}"
+		)
+		frappe.db.commit()
+
+
+def send_reply(communication, number):
+	comm = frappe.get_doc("Communication", communication)
+	account = ticket_account(comm.reference_name)
 
 	outgoing = []
 	text, inline_urls = split_inline_images(comm.content or "")
@@ -320,26 +394,7 @@ def send_reply(communication, number):
 		outgoing.append({"content_type": media_type(url), "attach": url})
 
 	for payload in outgoing:
-		try:
-			frappe.get_doc(
-				{
-					"doctype": "WhatsApp Message",
-					"type": "Outgoing",
-					"to": number,
-					"whatsapp_account": account,
-					"reference_doctype": "HD Ticket",
-					"reference_name": comm.reference_name,
-					**payload,
-				}
-			).insert(ignore_permissions=True)
-			frappe.db.commit()
-		except Exception as e:
-			frappe.db.rollback()
-			frappe.log_error("Helpdesk -> WhatsApp send failed", reference_doctype="HD Ticket", reference_name=comm.reference_name)
-			frappe.get_doc("HD Ticket", comm.reference_name).add_comment(
-				"Comment", f"Gagal mengirim balasan ke WhatsApp: {escape_html(str(e))}"
-			)
-			frappe.db.commit()
+		send_to_customer(comm.reference_name, number, account, payload)
 
 
 def split_inline_images(html):

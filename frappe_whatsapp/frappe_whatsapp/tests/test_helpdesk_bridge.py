@@ -248,6 +248,33 @@ def _check_evolution():
 		new_ticket = helpdesk.open_ticket(number)
 		assert new_ticket and new_ticket != ticket, (new_ticket, ticket)
 		assert frappe.db.get_value("HD Ticket", new_ticket, "subject") == "halo lagi"
+		assert "Ketik *menu*" in calls[-1][1]["text"], calls
+
+		# 6c. "menu" on an open ticket -> that ticket closed, menu again, the choice opens a new ticket
+		calls.clear()
+		queued = []
+		with patch.object(helpdesk.frappe, "enqueue", lambda fn, **kw: queued.append(fn)):
+			evolution.save_incoming(account, evo_msg("E9", {"conversation": " Menu "}))
+		assert helpdesk.send_closing_message not in queued, queued  # menu switch: no goodbye
+		assert frappe.db.get_value("HD Ticket", new_ticket, "status") == "Closed"
+		assert not helpdesk.open_ticket(number)
+		assert calls and f"2. {team}" in calls[-1][1]["text"], calls
+		evolution.save_incoming(account, evo_msg("E10", {"conversation": "2"}))
+		third = helpdesk.open_ticket(number)
+		assert third and third not in (ticket, new_ticket), third
+		assert frappe.db.get_value("HD Ticket", third, "subject") != "Menu"
+		assert frappe.db.get_value("WhatsApp Message", {"message_id": "E9"}, "reference_name") == new_ticket
+
+		# 6d. agent resolves -> one closing message; Resolved -> Closed sends no second one
+		calls.clear()
+		run_now = lambda fn, enqueue_after_commit=False, **kw: fn(**kw)
+		with patch.object(helpdesk.frappe, "enqueue", run_now), patch.object(frappe.db, "commit"), patch.object(frappe.db, "rollback"):
+			for status in ("Resolved", "Closed"):
+				t3 = frappe.get_doc("HD Ticket", third)
+				t3.status = status
+				t3.save(ignore_permissions=True)
+		texts = [b["text"] for p, b in calls if "sendText" in p]
+		assert texts == [helpdesk.CLOSED_TEXT.format(team=team)], calls
 
 	# 7. webhook token: right token for the instance passes, wrong one is refused
 	with patch("frappe_whatsapp.utils.evolution.frappe.get_request_header", lambda h: "evo-secret"):
@@ -262,6 +289,25 @@ def _check_evolution():
 
 	# 8. privacy ids resolve to the phone number
 	assert evolution.sender_number({"remoteJid": "abc@lid", "remoteJidAlt": f"{number}@s.whatsapp.net"}) == number
+
+	# 9. connection monitor alerts once per outage, again after it recovered and dropped
+	states = iter(["open", "close", "close", "open", "connecting"])
+
+	def state_api(acc, method, path, payload=None):
+		return {"instance": {"state": next(states) if acc.name == account.name else "open"}}
+
+	alerts = lambda: frappe.db.count("Notification Log", {"document_name": account.name, "subject": ["like", "%terputus%"]})
+	key = f"wa_evolution_down:{account.name}"
+	frappe.cache.delete_value(key)
+	recipients = len(evolution.alert_recipients(account))
+	assert recipients, "no one to alert"
+	try:
+		with patch.object(evolution, "api", state_api):
+			for expected in (0, 1, 1, 1, 2):
+				evolution.check_connections()
+				assert alerts() == expected * recipients, (alerts(), expected)
+	finally:
+		frappe.cache.delete_value(key)
 
 
 def _check_departments():
