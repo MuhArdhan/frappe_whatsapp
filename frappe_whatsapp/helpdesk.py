@@ -21,6 +21,8 @@ MEDIA_TYPES = ("image", "audio", "video", "document")
 OPEN_CATEGORIES = ("Open", "Paused")
 HARI = ("Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu")
 BULAN = ("Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember")
+# WhatsApp Message status -> helpdesk timeline badge; Communication has no "Delivered" option
+DELIVERY_BADGE = {"sent": "Sent", "delivered": "Sent", "read": "Read", "played": "Read", "failed": "Error"}
 PENDING_WINDOW_HOURS = 24  # unlinked messages older than this are not pulled into a new ticket
 
 
@@ -54,6 +56,9 @@ def setup_custom_fields(app_name=None):
 
 def on_whatsapp_message(doc, method=None):
 	"""WhatsApp Message on_update."""
+	if doc.type == "Outgoing":
+		update_delivery_status(doc)
+		return
 	if doc.type != "Incoming" or doc.reference_name or doc.content_type == "reaction":
 		return
 	if doc.content_type in MEDIA_TYPES and not doc.attach:
@@ -73,6 +78,27 @@ def on_whatsapp_message(doc, method=None):
 		frappe.log_error("WhatsApp -> Helpdesk routing failed", reference_doctype=doc.doctype, reference_name=doc.name)
 	finally:
 		frappe.set_user(user)
+
+
+def update_delivery_status(msg):
+	"""Show sent/read of an agent reply as the delivery badge of its Communication (Meta and Evolution)."""
+	status = DELIVERY_BADGE.get((msg.status or "").lower())
+	if not status or not msg.message_id or not helpdesk_installed():
+		return
+	try:
+		row = frappe.db.get_value(
+			"Communication",
+			{"message_id": msg.message_id, "sent_or_received": "Sent", "reference_doctype": "HD Ticket"},
+			["name", "delivery_status", "reference_name"],
+			as_dict=True,
+		)
+		# statuses can arrive out of order; never go back from Read
+		if not row or row.delivery_status in (status, "Read"):
+			return
+		frappe.db.set_value("Communication", row.name, "delivery_status", status, update_modified=False)
+		frappe.get_doc("HD Ticket", row.reference_name).publish_update()
+	except Exception:
+		frappe.log_error("WhatsApp delivery status not shown on ticket", reference_doctype=msg.doctype, reference_name=msg.name)
 
 
 def route_message(msg):
@@ -418,9 +444,9 @@ def ticket_account(ticket):
 
 
 def send_to_customer(ticket, number, account, payload, what="balasan"):
-	"""Send one message in its own transaction; a failure becomes a comment on the ticket."""
+	"""Send one message in its own transaction; a failure becomes a comment on the ticket. Returns the message or None."""
 	try:
-		frappe.get_doc(
+		msg = frappe.get_doc(
 			{
 				"doctype": "WhatsApp Message",
 				"type": "Outgoing",
@@ -432,6 +458,7 @@ def send_to_customer(ticket, number, account, payload, what="balasan"):
 			}
 		).insert(ignore_permissions=True)
 		frappe.db.commit()
+		return msg
 	except Exception as e:
 		frappe.db.rollback()
 		frappe.log_error("Helpdesk -> WhatsApp send failed", reference_doctype="HD Ticket", reference_name=ticket)
@@ -462,8 +489,16 @@ def send_reply(communication, number):
 		# the first message carries the WhatsApp reply, like a person replying then sending files
 		outgoing[0].update(is_reply=1, reply_to_message_id=quoted_id)
 
-	for payload in outgoing:
-		send_to_customer(comm.reference_name, number, account, payload)
+	sent = [m for m in (send_to_customer(comm.reference_name, number, account, p) for p in outgoing) if m]
+	if outgoing:
+		# the badge follows the first message; later status updates find the reply by this id
+		first = sent[0] if sent else None
+		comm.db_set(
+			{"message_id": first.message_id if first else None, "delivery_status": "Sent" if first else "Error"},
+			update_modified=False,
+		)
+		frappe.db.commit()
+		frappe.get_doc("HD Ticket", comm.reference_name).publish_update()
 
 
 def split_inline_images(html):

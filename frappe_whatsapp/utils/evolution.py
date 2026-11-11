@@ -9,6 +9,7 @@ import base64
 import hmac
 import json
 import mimetypes
+import time
 
 import frappe
 import requests
@@ -22,6 +23,11 @@ WEBHOOK_PATH = "/api/method/frappe_whatsapp.utils.evolution.webhook"
 TOKEN_HEADER = "x-webhook-token"
 MEDIA_TYPES = ("image", "video", "audio", "document")
 SKIP_JIDS = ("@g.us", "@broadcast", "@newsletter")  # groups, status, channels
+# shortcut: a Frappe outage longer than this loses messages; raise it if deploys/outages can last longer
+SYNC_HOURS = 6
+SYNC_MIN_AGE_SECONDS = 120  # leave fresh messages to the webhook so both don't save the same one
+# Evolution MessageUpdate status -> (rank, WhatsApp Message status, same words as the Meta webhook)
+STATUS_RANK = {"SERVER_ACK": (1, "sent"), "DELIVERY_ACK": (2, "delivered"), "READ": (3, "read"), "PLAYED": (3, "played")}
 WRAPPERS = ("ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2", "documentWithCaptionMessage")
 
 
@@ -133,7 +139,8 @@ def connect(account):
 			"webhook": {
 				"enabled": True,
 				"url": base_url + WEBHOOK_PATH,
-				"events": ["MESSAGES_UPSERT"],
+				# UPDATE = sent/delivered/read right away; sync_messages still catches up if one is missed
+				"events": ["MESSAGES_UPSERT", "MESSAGES_UPDATE"],
 				"byEvents": False,
 				"base64": True,
 				# site header lets a Docker-internal URL (http://frappe:8000) reach the right site
@@ -181,6 +188,62 @@ def notify_down(account, state):
 		).insert(ignore_permissions=True)
 
 
+def sync_messages():
+	"""Scheduler: save incoming messages the webhook missed (Frappe down, deploy) and pick up
+	sent/delivered/read of outgoing ones, from Evolution's own message store."""
+	for name in frappe.get_all("WhatsApp Account", {"provider": PROVIDER, "status": "Active"}, pluck="name"):
+		account = frappe.get_doc("WhatsApp Account", name)
+		try:
+			records = recent_records(account)
+		except Exception:
+			frappe.log_error("Evolution sync: messages not fetched", reference_doctype="WhatsApp Account", reference_name=name)
+			continue
+		newest_allowed = time.time() - SYNC_MIN_AGE_SECONDS
+		# oldest first, so a menu choice is routed after the message that triggered the menu
+		for rec in sorted(records, key=lambda r: int(r.get("messageTimestamp") or 0)):
+			try:
+				if (rec.get("key") or {}).get("fromMe"):
+					sync_status(rec)
+				elif int(rec.get("messageTimestamp") or 0) <= newest_allowed:  # newer ones are the webhook's
+					save_incoming(account, rec)
+				frappe.db.commit()
+			except Exception:
+				frappe.db.rollback()
+				frappe.log_error("Evolution sync: message not processed", json.dumps(strip_base64(rec))[:5000])
+
+
+def recent_records(account):
+	"""Messages of the last SYNC_HOURS, newest first as Evolution returns them."""
+	cutoff = time.time() - SYNC_HOURS * 3600
+	out = []
+	for page in range(1, 100):
+		res = (api(account, "POST", f"/chat/findMessages/{account.evolution_instance}", {"page": page, "offset": 100}).get("messages") or {})
+		records = res.get("records") or []
+		out += [r for r in records if int(r.get("messageTimestamp") or 0) >= cutoff]
+		if not records or int(records[-1].get("messageTimestamp") or 0) < cutoff or page >= (res.get("pages") or 0):
+			break
+	return out
+
+
+def sync_status(rec):
+	apply_status(rec["key"].get("id"), [u.get("status") for u in rec.get("MessageUpdate") or []])
+
+
+def apply_status(message_id, statuses):
+	"""Raise an Outgoing message to its best Evolution status (webhook or sync); never lower it."""
+	name, current = frappe.db.get_value(
+		"WhatsApp Message", {"message_id": message_id, "type": "Outgoing"}, ["name", "status"]
+	) or (None, None)
+	if not name or (current or "").lower() == "failed":
+		return
+	best = max((STATUS_RANK[s] for s in statuses if s in STATUS_RANK), default=None)
+	rank = {s: r for r, s in STATUS_RANK.values()}
+	if best and best[0] > rank.get((current or "").lower(), 0):
+		doc = frappe.get_doc("WhatsApp Message", name)
+		doc.status = best[1]
+		doc.save(ignore_permissions=True)  # on_update moves the helpdesk badge
+
+
 def alert_recipients(account):
 	# System Manager is often handed out widely (cashiers etc.); the account's admins are the ones who can rescan
 	return {u for u in (account.owner, account.modified_by) if u and u != "Guest"}
@@ -192,21 +255,26 @@ def alert_recipients(account):
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def webhook():
 	payload = frappe.request.get_json(silent=True) or {}
-	account = authenticate(payload.get("instance"))
+	handle_event(authenticate(payload.get("instance")), payload)
 
+
+def handle_event(account, payload):
 	event = (payload.get("event") or "").lower().replace("_", ".")
-	if event != "messages.upsert":
+	if event not in ("messages.upsert", "messages.update"):
 		return
 
 	data = payload.get("data") or {}
-	messages = data if isinstance(data, list) else [data]
+	items = data if isinstance(data, list) else [data]
 	log_payload(payload)
-	for message in messages:
+	for item in items:
 		try:
-			save_incoming(account, message)
+			if event == "messages.upsert":
+				save_incoming(account, item)
+			elif item.get("fromMe") and item.get("keyId"):  # status of a message we sent
+				apply_status(item["keyId"], [item.get("status")])
 		except Exception:
 			# answer 2xx anyway: a non-4xx error makes Evolution retry the same message
-			frappe.log_error("Evolution webhook: message not saved", json.dumps(strip_base64(message))[:5000])
+			frappe.log_error(f"Evolution webhook: {event} not processed", json.dumps(strip_base64(item))[:5000])
 
 
 def authenticate(instance):

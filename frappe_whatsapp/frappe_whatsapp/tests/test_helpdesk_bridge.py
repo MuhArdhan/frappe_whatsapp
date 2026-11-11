@@ -10,8 +10,10 @@ Meta and Evolution API calls are mocked; nothing is sent to WhatsApp.
 import base64
 import hashlib
 import hmac
+import itertools
 import os
 import random
+import time
 import types
 from unittest.mock import patch
 
@@ -235,12 +237,13 @@ def _check_evolution():
 	).insert(ignore_permissions=True).name
 	number = f"62998{random.randint(1000000, 9999999)}"
 	calls = []
+	ids = itertools.count(1)  # unique even after calls.clear()
 
 	def fake_api(acc, method, path, payload=None):
 		calls.append((path, payload))
 		if "getBase64" in path:
 			return {"base64": base64.b64encode(b"\x89PNG evo").decode()}
-		return {"key": {"id": f"EV{len(calls)}"}}
+		return {"key": {"id": f"EV{next(ids)}"}}
 
 	def evo_msg(msg_id, message, jid=None):
 		return {"key": {"remoteJid": jid or f"{number}@s.whatsapp.net", "fromMe": False, "id": msg_id},
@@ -364,6 +367,52 @@ def _check_evolution():
 		assert body["text"] == "Jam 10 kak" and body["quoted"] == {"key": {"id": "E13"}}, body
 		body = agent_reply('<p>Oke</p><p class="reply-to-content"></p><blockquote><p>tidak ada di ticket</p></blockquote>')
 		assert body["text"] == "Oke" and "quoted" not in body, body
+
+		# 6h. sync: a message the webhook missed is saved and routed once; read status reaches the agent's reply
+		reply_comm = frappe.get_all(
+			"Communication", {"reference_name": third, "sent_or_received": "Sent", "message_id": ["is", "set"]},
+			["name", "message_id", "delivery_status"], order_by="creation desc", limit=1,
+		)[0]
+		assert reply_comm.delivery_status == "Sent", reply_comm
+		now = int(time.time())
+		records = [
+			{**evo_msg("S1", {"conversation": "terlewat"}), "messageTimestamp": now - 600},
+			{**evo_msg("S2", {"conversation": "terlalu baru"}), "messageTimestamp": now - 10},
+			{**evo_msg("S3", {"conversation": "terlalu lama"}), "messageTimestamp": now - 7 * 3600},
+			{"key": {"id": reply_comm.message_id, "fromMe": True, "remoteJid": f"{number}@s.whatsapp.net"},
+			 "messageTimestamp": now - 300, "MessageUpdate": [{"status": "SERVER_ACK"}, {"status": "READ"}, {"status": "DELIVERY_ACK"}]},
+		]
+
+		def sync_api(acc, method, path, payload=None):
+			if "findMessages" in path:
+				return {"messages": {"pages": 1, "records": records if acc.name == account.name else []}}
+			return fake_api(acc, method, path, payload)
+
+		with patch.object(evolution, "api", sync_api), patch.object(frappe.db, "commit"), patch.object(frappe.db, "rollback"):
+			evolution.sync_messages()
+			evolution.sync_messages()  # second run finds nothing new
+		assert frappe.db.count("WhatsApp Message", {"message_id": "S1"}) == 1
+		assert frappe.db.get_value("WhatsApp Message", {"message_id": "S1"}, "reference_name") == third
+		assert not frappe.db.exists("WhatsApp Message", {"message_id": ["in", ["S2", "S3"]]})
+		assert frappe.db.get_value("WhatsApp Message", {"message_id": reply_comm.message_id}, "status") == "read"
+		assert frappe.db.get_value("Communication", reply_comm.name, "delivery_status") == "Read"
+
+		# 6i. webhook MESSAGES_UPDATE: status at once; a late DELIVERY_ACK doesn't lower READ
+		other = frappe.get_all(
+			"Communication", {"reference_name": third, "sent_or_received": "Sent", "message_id": ["is", "set"]},
+			["name", "message_id", "delivery_status"], order_by="creation desc", limit=2,
+		)[1]
+		assert other.delivery_status == "Sent", other
+		upd = lambda status, key_id=other.message_id, from_me=True: {
+			"event": "messages.update", "instance": account.evolution_instance,
+			"data": {"keyId": key_id, "fromMe": from_me, "status": status, "remoteJid": f"{number}@s.whatsapp.net"},
+		}
+		evolution.handle_event(account, upd("READ"))
+		evolution.handle_event(account, upd("DELIVERY_ACK"))
+		assert frappe.db.get_value("WhatsApp Message", {"message_id": other.message_id}, "status") == "read"
+		assert frappe.db.get_value("Communication", other.name, "delivery_status") == "Read"
+		evolution.handle_event(account, upd("READ", key_id="S1", from_me=False))  # customer's own message: ignored
+		assert frappe.db.get_value("WhatsApp Message", {"message_id": "S1"}, "status") != "read"
 
 		# 6d. agent resolves -> one closing message; Resolved -> Closed sends no second one
 		calls.clear()
