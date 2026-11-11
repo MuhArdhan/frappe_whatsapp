@@ -126,6 +126,7 @@ scheduler_events = {
         "frappe_whatsapp.utils.trigger_whatsapp_notifications_hourly_long"
     ],
     "daily": [
+        "frappe_whatsapp.helpdesk_departments.sync",  # safety net for missed events
         "frappe_whatsapp.utils.trigger_whatsapp_notifications_daily",
         "frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_notification.whatsapp_notification.trigger_notifications",
     ],
@@ -221,10 +222,22 @@ doc_events = {
     # Helpdesk bridge (no-ops on sites without helpdesk)
     "WhatsApp Message": {"on_update": "frappe_whatsapp.helpdesk.on_whatsapp_message"},
     "Communication": {"after_insert": "frappe_whatsapp.helpdesk.on_communication"},
+    # Department -> HD Team sync (no-ops without helpdesk + erpnext)
+    "Employee": {
+        "on_update": "frappe_whatsapp.helpdesk_departments.queue_sync",
+        "on_trash": "frappe_whatsapp.helpdesk_departments.queue_sync",
+    },
+    "Department": {
+        "on_update": "frappe_whatsapp.helpdesk_departments.queue_sync",
+        "on_trash": "frappe_whatsapp.helpdesk_departments.queue_sync",
+    },
 }
 
 override_doctype_class = {
     "HD Ticket": "frappe_whatsapp.helpdesk_ticket.WhatsAppHDTicket",
 }
 
-after_migrate = ["frappe_whatsapp.helpdesk.setup_custom_fields"]
+after_migrate = [
+    "frappe_whatsapp.helpdesk.setup_custom_fields",
+    "frappe_whatsapp.helpdesk_departments.setup_custom_fields",
+]

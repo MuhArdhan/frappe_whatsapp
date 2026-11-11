@@ -27,6 +27,13 @@ class WhatsAppAccount(Document):
 				whatsapp_account.save()
 
 	@frappe.whitelist()
+	def evolution_connect(self):
+		"""Evolution API: set up the instance and webhook; return a QR code until linked."""
+		from frappe_whatsapp.utils import evolution
+
+		return evolution.connect(self)
+
+	@frappe.whitelist()
 	def subscribe_app(self):
 		"""Subscribe this app to webhooks for the WhatsApp Business Account.
 

@@ -9,7 +9,7 @@ from frappe import _, throw
 from frappe.model.document import Document
 from frappe.integrations.utils import make_post_request
 
-from frappe_whatsapp.utils import get_whatsapp_account, format_number
+from frappe_whatsapp.utils import evolution, get_whatsapp_account, format_number
 
 class WhatsAppMessage(Document):
     def validate(self):
@@ -73,6 +73,15 @@ class WhatsAppMessage(Document):
         on template sends, `send_template` -> `notify` raises on error.
         """
         if self.type != "Outgoing":
+            return
+
+        if evolution.is_evolution(self.whatsapp_account):
+            try:
+                self.message_id = evolution.send(self)
+                self.status = "Success"
+            except Exception as e:
+                self.status = "Failed"
+                frappe.throw(f"Failed to send message {str(e)}")
             return
 
         if self.message_type != "Template":
@@ -412,6 +421,8 @@ class WhatsAppMessage(Document):
 
     @frappe.whitelist()
     def send_read_receipt(self):
+        if evolution.is_evolution(self.whatsapp_account):
+            return  # Meta-only endpoint
         data = {
             "messaging_product": "whatsapp",
             "status": "read",

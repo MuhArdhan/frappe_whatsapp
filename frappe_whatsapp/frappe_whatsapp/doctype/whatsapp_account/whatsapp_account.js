@@ -3,6 +3,10 @@
 
 frappe.ui.form.on("WhatsApp Account", {
 	refresh(frm) {
+		if (!frm.is_new() && frm.doc.provider === "Evolution API") {
+			frm.add_custom_button(__("Connect WhatsApp (QR)"), () => evolution_connect(frm));
+			return;
+		}
 		if (!frm.is_new()) {
 			frm.add_custom_button(__("Subscribe App to Webhooks"), () => {
 				frappe.confirm(
@@ -30,3 +34,28 @@ frappe.ui.form.on("WhatsApp Account", {
 		}
 	},
 });
+
+function evolution_connect(frm) {
+	const dialog = new frappe.ui.Dialog({
+		title: __("Connect WhatsApp"),
+		fields: [{ fieldtype: "HTML", fieldname: "qr" }],
+		primary_action_label: __("Refresh"),
+		primary_action: () => load(),
+	});
+	const load = () =>
+		frm.call({ doc: frm.doc, method: "evolution_connect", freeze: true }).then((r) => {
+			const res = r.message || {};
+			const html =
+				res.state === "open"
+					? `<p class="text-success">${__("WhatsApp is connected.")}</p>`
+					: res.qr
+					? `<p>${__("WhatsApp on your phone → Linked devices → Link a device, then scan:")}</p>
+					   <img src="${res.qr}" style="width:280px;max-width:100%">
+					   <p class="text-muted">${__("The QR expires quickly; press Refresh for a new one.")}</p>`
+					: `<p>${__("No QR code yet (state: {0}). Press Refresh.", [res.state || "-"])}</p>`;
+			dialog.fields_dict.qr.$wrapper.html(html);
+			frm.reload_doc();
+		});
+	dialog.show();
+	load();
+}

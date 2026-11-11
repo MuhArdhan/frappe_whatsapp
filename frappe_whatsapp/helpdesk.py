@@ -6,8 +6,10 @@ back to WhatsApp.
 """
 import json
 import mimetypes
+from urllib.parse import unquote
 
 import frappe
+from bs4 import BeautifulSoup
 from frappe.core.utils import html2text
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 from frappe.utils import add_to_date, escape_html, now_datetime
@@ -73,7 +75,6 @@ def on_whatsapp_message(doc, method=None):
 
 def route_message(msg):
 	number = msg.get("from")
-	choice = team_choice(msg)
 
 	ticket = open_ticket(number)
 	if ticket:
@@ -81,21 +82,63 @@ def route_message(msg):
 		return
 
 	teams = active_teams()
-	if teams and choice not in teams:
+	choice = team_choice(msg, teams)
+	if teams and not choice:
 		# a stale/unknown choice gets the menu again right away
-		send_team_menu(msg, teams, force=bool(choice))
+		send_team_menu(msg, teams, force=looks_like_choice(msg))
 		return
 
 	ticket = create_ticket(msg, choice)
 	for pending in pending_messages(number):
-		link_message(pending, ticket)
+		# the choice itself is routing info, not conversation
+		link_message(pending, ticket, log=pending.name != msg.name)
 
 
-def team_choice(msg):
-	text = msg.message or ""
+def team_choice(msg, teams):
+	"""Team picked by a menu button, or by its number in a text reply (text menu)."""
+	text = (msg.message or "").strip()
 	if msg.content_type == "button" and text.startswith(TEAM_PREFIX):
-		return text[len(TEAM_PREFIX) :]
+		team = text[len(TEAM_PREFIX) :]
+		return team if team in teams else None
+	if msg.content_type == "text" and text.isdigit():
+		# number refers to the menu the customer saw, not today's team list
+		options = last_menu(msg.get("from"))
+		index = int(text) - 1
+		if 0 <= index < len(options):
+			team = options[index]["id"][len(TEAM_PREFIX) :]
+			return team if team in teams else None
 	return None
+
+
+def last_menu(number):
+	if not menu_sent_within(number, PENDING_WINDOW_HOURS * 60):
+		return []
+	buttons = frappe.db.get_value(
+		"WhatsApp Message",
+		{"type": "Outgoing", "to": number, "content_type": "interactive"},
+		"buttons",
+		order_by="creation desc",
+	)
+	return json.loads(buttons or "[]")
+
+
+def looks_like_choice(msg):
+	text = (msg.message or "").strip()
+	return (msg.content_type == "button" and text.startswith(TEAM_PREFIX)) or (
+		msg.content_type == "text" and text.isdigit() and menu_sent_within(msg.get("from"), PENDING_WINDOW_HOURS * 60)
+	)
+
+
+def menu_sent_within(number, minutes):
+	return frappe.db.exists(
+		"WhatsApp Message",
+		{
+			"type": "Outgoing",
+			"to": number,
+			"content_type": "interactive",
+			"creation": [">", add_to_date(now_datetime(), minutes=-minutes)],
+		},
+	)
 
 
 def open_ticket(number):
@@ -128,16 +171,7 @@ def pending_messages(number):
 
 def send_team_menu(msg, teams, force=False):
 	number = msg.get("from")
-	recently_sent = frappe.db.exists(
-		"WhatsApp Message",
-		{
-			"type": "Outgoing",
-			"to": number,
-			"content_type": "interactive",
-			"creation": [">", add_to_date(now_datetime(), minutes=-MENU_COOLDOWN_MINUTES)],
-		},
-	)
-	if recently_sent and not force:
+	if not force and menu_sent_within(number, MENU_COOLDOWN_MINUTES):
 		return
 	frappe.get_doc(
 		{
@@ -156,18 +190,27 @@ def send_team_menu(msg, teams, force=False):
 def create_ticket(msg, team):
 	number = msg.get("from")
 	name = msg.profile_name or number
-	first_text = next((m.message for m in pending_messages(number) if m.content_type == "text" and m.message), None)
+	first_text = next(
+		(m.message for m in pending_messages(number) if m.content_type == "text" and m.message and m.name != msg.name),
+		None,
+	)
 	ticket = frappe.get_doc(
 		{
 			"doctype": "HD Ticket",
 			"subject": (first_text or f"WhatsApp: {name}")[:140],
 			"whatsapp_number": number,
+			# the agent reply box refuses to send without a recipient; .invalid never receives mail
+			"raised_by": placeholder_email(number),
 			"agent_group": team,
 			"contact": get_or_create_contact(number, name),
 		}
 	)
 	ticket.insert(ignore_permissions=True)
 	return ticket.name
+
+
+def placeholder_email(number):
+	return f"{number}@whatsapp.invalid"
 
 
 def get_or_create_contact(number, name):
@@ -181,10 +224,10 @@ def get_or_create_contact(number, name):
 	return contact.name
 
 
-def link_message(msg, ticket):
+def link_message(msg, ticket, log=True):
 	msg.db_set({"reference_doctype": "HD Ticket", "reference_name": ticket}, update_modified=False)
-	if team_choice(msg):
-		return  # the menu tap is routing info, not conversation
+	if not log or (msg.content_type == "button" and (msg.message or "").startswith(TEAM_PREFIX)):
+		return  # menu taps are routing info, not conversation
 
 	content = escape_html(msg.message or "").replace("\n", "<br>")
 	if msg.attach:
@@ -243,15 +286,16 @@ def send_reply(communication, number):
 	)
 
 	outgoing = []
-	text = html2text(comm.content or "").strip()
+	text, inline_urls = split_inline_images(comm.content or "")
 	if text:
 		outgoing.append({"content_type": "text", "message": text})
-	for f in frappe.get_all(
+	files = frappe.get_all(
 		"File",
 		filters={"attached_to_doctype": "Communication", "attached_to_name": comm.name},
-		fields=["file_url", "file_name"],
-	):
-		outgoing.append({"content_type": media_type(f.file_name), "attach": f.file_url})
+		pluck="file_url",
+	)
+	for url in dict.fromkeys(inline_urls + files):  # an inline image may also be attached
+		outgoing.append({"content_type": media_type(url), "attach": url})
 
 	for payload in outgoing:
 		try:
@@ -274,6 +318,18 @@ def send_reply(communication, number):
 				"Comment", f"Gagal mengirim balasan ke WhatsApp: {escape_html(str(e))}"
 			)
 			frappe.db.commit()
+
+
+def split_inline_images(html):
+	"""(plain text, site file urls) — images pasted into the editor are sent as media, not markdown."""
+	soup = BeautifulSoup(html, "html.parser")
+	urls = []
+	for img in soup.find_all("img"):
+		src = unquote(img.get("src") or "")
+		if src.startswith(("/files/", "/private/files/")) and frappe.db.exists("File", {"file_url": src}):
+			urls.append(src)
+		img.decompose()
+	return html2text(str(soup)).strip(), urls
 
 
 def media_type(file_name):

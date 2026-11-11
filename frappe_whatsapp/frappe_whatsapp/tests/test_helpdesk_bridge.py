@@ -5,8 +5,9 @@ back, so it is safe on a dev site with data:
 
     bench --site <site> execute frappe_whatsapp.frappe_whatsapp.tests.test_helpdesk_bridge.run
 
-Meta API calls are mocked; nothing is sent to WhatsApp.
+Meta and Evolution API calls are mocked; nothing is sent to WhatsApp.
 """
+import base64
 import hashlib
 import hmac
 import os
@@ -18,6 +19,7 @@ import frappe
 
 from frappe_whatsapp import helpdesk
 from frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_message.whatsapp_message import WhatsAppMessage
+from frappe_whatsapp.utils import evolution
 
 
 def run():
@@ -31,6 +33,8 @@ def run():
 		):
 			_check_flow(sent)
 			_check_signature()
+			_check_evolution()
+			_check_departments()
 		print("helpdesk bridge self-check: OK")
 	finally:
 		frappe.db.rollback()
@@ -87,6 +91,7 @@ def _check_flow(sent):
 	assert ticket, "ticket not created"
 	t = frappe.get_doc("HD Ticket", ticket)
 	assert t.agent_group == team, t.agent_group
+	assert t.raised_by == f"{number}@whatsapp.invalid", t.raised_by  # fills the reply box's To
 	assert t.subject == "Pesanan saya belum sampai", t.subject
 	assert t.contact
 	received = frappe.get_all("Communication", {"reference_name": ticket, "sent_or_received": "Received"}, pluck="content", order_by="creation asc")
@@ -150,3 +155,147 @@ def _check_signature():
 				raise AssertionError("bad signature accepted")
 	finally:
 		frappe.local.request = old_request
+
+
+def _check_evolution():
+	"""Same helpdesk flow over the Evolution API provider, with a numbered text menu."""
+	account = frappe.get_doc(
+		{"doctype": "WhatsApp Account", "account_name": "wa-selfcheck-evo", "status": "Active",
+		 "provider": "Evolution API", "evolution_instance": "selfcheck-" + frappe.generate_hash(length=6),
+		 "url": "http://evolution.example", "token": "k", "webhook_verify_token": "evo-secret"}
+	).insert(ignore_permissions=True)
+	team = frappe.get_doc(
+		{"doctype": "HD Team", "team_name": "WA Evo " + frappe.generate_hash(length=4), "users": [{"user": "Administrator"}]}
+	).insert(ignore_permissions=True).name
+	number = f"62998{random.randint(1000000, 9999999)}"
+	calls = []
+
+	def fake_api(acc, method, path, payload=None):
+		calls.append((path, payload))
+		if "getBase64" in path:
+			return {"base64": base64.b64encode(b"\x89PNG evo").decode()}
+		return {"key": {"id": f"EV{len(calls)}"}}
+
+	def evo_msg(msg_id, message, jid=None):
+		return {"key": {"remoteJid": jid or f"{number}@s.whatsapp.net", "fromMe": False, "id": msg_id},
+				"pushName": "Sari Evo", "message": message, "messageType": next(iter(message), "")}
+
+	with patch.object(evolution, "api", fake_api), patch.object(helpdesk, "active_teams", lambda: ["Other Team", team]):
+		# 1. first message -> numbered text menu via sendText
+		evolution.save_incoming(account, evo_msg("E1", {"conversation": "Mesin kasir error"}))
+		path, body = calls[-1]
+		assert path == f"/message/sendText/{account.evolution_instance}", calls
+		assert body["number"] == number and f"2. {team}" in body["text"], body
+		assert frappe.db.get_value("WhatsApp Message", {"message_id": "EV1"}, "status") == "Success"
+
+		# 2. invalid number -> menu again (forced), still no ticket
+		evolution.save_incoming(account, evo_msg("E2", {"conversation": "9"}))
+		assert not helpdesk.open_ticket(number)
+		assert sum(1 for p, _ in calls if "sendText" in p) == 2
+
+		# 3. a team added after the menu went out must not shift the numbering
+		with patch.object(helpdesk, "active_teams", lambda: ["Another", "Other Team", team]):
+			# reply "2" -> ticket for that team; "2" itself is not logged as conversation
+			evolution.save_incoming(account, evo_msg("E3", {"extendedTextMessage": {"text": "2"}}))
+		ticket = helpdesk.open_ticket(number)
+		assert ticket and frappe.db.get_value("HD Ticket", ticket, "agent_group") == team
+		assert frappe.db.get_value("HD Ticket", ticket, "subject") == "Mesin kasir error"
+		received = frappe.get_all("Communication", {"reference_name": ticket, "sent_or_received": "Received"}, pluck="content")
+		assert "2" not in received and any("kasir" in c for c in received), received
+
+		# 4. image without inline base64 -> fetched, stored privately, attached to the ticket
+		evolution.save_incoming(account, evo_msg("E4", {"imageMessage": {"mimetype": "image/png", "caption": "foto"}}))
+		url = frappe.db.get_value("WhatsApp Message", {"message_id": "E4"}, "attach")
+		assert url and url.startswith("/private/files/"), url
+		_disk_files.append(frappe.get_doc("File", {"file_url": url}).get_full_path())
+		assert frappe.db.exists("File", {"attached_to_doctype": "HD Ticket", "attached_to_name": ticket, "file_url": url})
+
+		# 5. duplicates, own messages and groups are ignored
+		before = frappe.db.count("WhatsApp Message")
+		evolution.save_incoming(account, evo_msg("E4", {"conversation": "dup"}))
+		evolution.save_incoming(account, {**evo_msg("E5", {"conversation": "me"}), "key": {"remoteJid": f"{number}@s.whatsapp.net", "fromMe": True, "id": "E5"}})
+		evolution.save_incoming(account, evo_msg("E6", {"conversation": "grup"}, jid="12345@g.us"))
+		assert frappe.db.count("WhatsApp Message") == before
+
+		# 6. agent reply with an inline image (name with spaces) and an attachment -> text + image + document
+		inline = _make_file("selfcheck evo inline.png", b"PNG inline")
+		comm = frappe.get_doc(
+			{"doctype": "Communication", "communication_type": "Communication", "communication_medium": "",
+			 "sent_or_received": "Sent",
+			 "content": f'<p>Sudah kami cek</p><p><img src="{inline.replace(" ", "%20")}"></p>',
+			 "reference_doctype": "HD Ticket", "reference_name": ticket, "subject": "Re"}
+		).insert(ignore_permissions=True)
+		frappe.get_doc("HD Ticket", ticket).attach_file_with_doc("Communication", comm.name, _make_file("selfcheck-evo.txt", b"nota"))
+		calls.clear()
+		with patch.object(frappe.db, "commit"), patch.object(frappe.db, "rollback"):
+			helpdesk.send_reply(comm.name, number)
+		assert calls[0][0].startswith("/message/sendText/") and calls[0][1]["text"] == "Sudah kami cek", calls
+		assert calls[1][1]["mediatype"] == "image" and calls[1][1]["fileName"] == "selfcheck evo inline.png", calls
+		media = calls[2][1]
+		assert calls[2][0].startswith("/message/sendMedia/") and media["mediatype"] == "document", calls
+		assert media["fileName"] == "selfcheck-evo.txt" and base64.b64decode(media["media"]) == b"nota"
+
+	# 7. webhook token: right token for the instance passes, wrong one is refused
+	with patch("frappe_whatsapp.utils.evolution.frappe.get_request_header", lambda h: "evo-secret"):
+		assert evolution.authenticate(account.evolution_instance).name == account.name
+	with patch("frappe_whatsapp.utils.evolution.frappe.get_request_header", lambda h: "wrong"):
+		try:
+			evolution.authenticate(account.evolution_instance)
+		except frappe.PermissionError:
+			pass
+		else:
+			raise AssertionError("wrong webhook token accepted")
+
+	# 8. privacy ids resolve to the phone number
+	assert evolution.sender_number({"remoteJid": "abc@lid", "remoteJidAlt": f"{number}@s.whatsapp.net"}) == number
+
+
+def _check_departments():
+	"""Ticked departments become HD Teams; same-named departments of two companies share one."""
+	from frappe_whatsapp import helpdesk_departments as hd
+
+	companies = frappe.get_all("Company", pluck="name", limit=2, order_by="name asc")
+	gender = frappe.get_all("Gender", pluck="name", limit=1)[0]
+	dept_name = "WA Dept " + frappe.generate_hash(length=4)
+	manual = {t.name: t.disabled for t in frappe.get_all("HD Team", fields=["name", "disabled"])}
+
+	def employee(company):
+		user = frappe.get_doc(
+			{"doctype": "User", "email": f"wa-{frappe.generate_hash(length=8)}@example.com",
+			 "first_name": "Dept Test", "send_welcome_email": 0}
+		).insert(ignore_permissions=True).name
+		dept = frappe.get_doc(
+			{"doctype": "Department", "department_name": dept_name, "company": company, hd.FLAG: 1}
+		).insert(ignore_permissions=True).name
+		emp = frappe.get_doc(
+			{"doctype": "Employee", "first_name": "Dept Test", "gender": gender, "date_of_birth": "1990-01-01",
+			 "date_of_joining": "2020-01-01", "company": company, "status": "Active",
+			 "department": dept, "user_id": user}
+		).insert(ignore_permissions=True)
+		return user, dept, emp
+
+	user1, dept1, emp1 = employee(companies[0])
+	user2, dept2, _ = employee(companies[-1])
+	hd.sync()
+
+	# 1. one team named after the department, both companies' employees, agents created
+	team = frappe.get_doc("HD Team", dept_name)
+	assert team.get(hd.SYNCED) and not team.disabled
+	assert sorted(r.user for r in team.users) == sorted({user1, user2}), team.users
+	assert frappe.db.exists("HD Agent", user1) and frappe.db.exists("HD Agent", user2)
+
+	# 2. employee leaves -> removed from the team
+	if user1 != user2 and len(companies) > 1:
+		emp1.status = "Left"
+		emp1.relieving_date = "2026-01-01"
+		emp1.save(ignore_permissions=True)
+		hd.sync()
+		assert [r.user for r in frappe.get_doc("HD Team", dept_name).users] == [user2]
+
+	# 3. untick -> team disabled (kept for old tickets), manual teams untouched
+	for d in {dept1, dept2}:
+		frappe.db.set_value("Department", d, hd.FLAG, 0)
+	hd.sync()
+	assert frappe.db.get_value("HD Team", dept_name, "disabled") == 1
+	for name, disabled in manual.items():
+		assert frappe.db.get_value("HD Team", name, "disabled") == disabled, name
