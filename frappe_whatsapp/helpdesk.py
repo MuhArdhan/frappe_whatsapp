@@ -10,9 +10,9 @@ from urllib.parse import unquote
 
 import frappe
 from bs4 import BeautifulSoup
-from frappe.core.utils import html2text
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
-from frappe.utils import add_to_date, escape_html, now_datetime
+from frappe.utils import add_to_date, escape_html, get_datetime, now_datetime
+from markdownify import MarkdownConverter, abstract_inline_conversion
 
 TEAM_PREFIX = "hd_team:"
 MEDIA_TYPES = ("image", "audio", "video", "document")
@@ -29,7 +29,11 @@ CLOSED_TEXT = (
 	"Jika ada pertanyaan lain, silakan kirim pesan kembali."
 )
 CLOSED_TEXT_NO_TEAM = "Percakapan Anda sudah selesai. Terima kasih! Jika ada pertanyaan lain, silakan kirim pesan kembali."
-CONFIRM_TEXT_NO_TEAM ="Terima kasih, pesan Anda sudah kami terima. Tim kami akan segera membalas."
+CONFIRM_TEXT_NO_TEAM = "Terima kasih, pesan Anda sudah kami terima. Tim kami akan segera membalas."
+OFF_HOURS_PREFIX = "Saat ini di luar jam kerja kami."
+OFF_HOURS_NOTE_HOURS = 12  # shortcut: one note per 12h, not per closed period; enough for overnight/weekend
+HARI = ("Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu")
+BULAN = ("Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember")
 MENU_COOLDOWN_MINUTES = 30  # don't resend the menu for every message while the customer decides
 PENDING_WINDOW_HOURS = 24  # unlinked messages older than this are not pulled into a new ticket
 
@@ -96,6 +100,7 @@ def route_message(msg):
 		ticket = None
 	if ticket:
 		link_message(msg, ticket)
+		maybe_send_off_hours_note(msg, ticket)
 		return
 
 	teams = active_teams()
@@ -127,6 +132,51 @@ def close_for_switch(ticket):
 
 def send_confirmation(msg, ticket, team):
 	text = (CONFIRM_TEXT if team else CONFIRM_TEXT_NO_TEAM).format(team=team, ticket=ticket)
+	note = off_hours_note(frappe.db.get_value("HD Ticket", ticket, "sla"))
+	send_courtesy(msg, ticket, f"{text}\n\n{note}" if note else text)
+
+
+def maybe_send_off_hours_note(msg, ticket):
+	"""Message on an open ticket outside working hours: say when we answer, at most once per OFF_HOURS_NOTE_HOURS."""
+	note = off_hours_note(frappe.db.get_value("HD Ticket", ticket, "sla"))
+	if not note:
+		return
+	since = add_to_date(now_datetime(), hours=-OFF_HOURS_NOTE_HOURS)
+	already = frappe.db.exists(
+		"WhatsApp Message",
+		{"type": "Outgoing", "to": msg.get("from"), "message": ["like", f"%{OFF_HOURS_PREFIX}%"], "creation": [">", since]},
+	)
+	if not already:
+		send_courtesy(msg, ticket, note)
+
+
+def off_hours_note(sla_name=None, now=None):
+	"""Off-hours text with the next opening time, or None in working hours / without an SLA calendar."""
+	sla_name = sla_name or frappe.db.get_value("HD Service Level Agreement", {"default_sla": 1, "enabled": 1}, "name")
+	if not sla_name:
+		return None
+	sla = frappe.get_cached_doc("HD Service Level Agreement", sla_name)
+	hours = sla.get_working_hours()
+	if not hours:
+		return None
+	now = now or now_datetime()
+	holidays = set(sla.get_holidays())
+	if now.date() not in holidays and sla.is_working_time(now, hours):
+		return None
+
+	today = hours.get(now.strftime("%A"))
+	if today and now.date() not in holidays and now - get_datetime(now.date()) < today[0]:
+		opens = get_datetime(now.date()) + today[0]  # before opening time today
+	else:
+		opens = sla.get_next_working_day_start(now)
+	if not opens:
+		return None
+	when = f"{HARI[opens.weekday()]}, {opens.day} {BULAN[opens.month - 1]} pukul {opens:%H.%M}"
+	return f"{OFF_HOURS_PREFIX} Pesan Anda sudah kami terima dan akan dibalas mulai {when}."
+
+
+def send_courtesy(msg, ticket, text):
+	"""A courtesy message must never roll back the ticket or the message routing."""
 	frappe.db.savepoint("wa_confirm")
 	try:
 		frappe.get_doc(
@@ -142,9 +192,8 @@ def send_confirmation(msg, ticket, team):
 			}
 		).insert(ignore_permissions=True)
 	except Exception:
-		# the ticket must survive a gateway hiccup; the confirmation is a courtesy
 		frappe.db.rollback(save_point="wa_confirm")
-		frappe.log_error("WhatsApp confirmation not sent", reference_doctype="HD Ticket", reference_name=ticket)
+		frappe.log_error("WhatsApp courtesy message not sent", reference_doctype="HD Ticket", reference_name=ticket)
 
 
 def team_choice(msg, teams):
@@ -265,14 +314,26 @@ def placeholder_email(number):
 
 
 def get_or_create_contact(number, name):
-	phones = [number, "+" + number]
-	contact = frappe.db.get_value("Contact Phone", {"phone": ["in", phones], "parenttype": "Contact"}, "parent")
+	contact = find_contact(number)
 	if contact:
 		return contact
 	contact = frappe.get_doc({"doctype": "Contact", "first_name": name})
 	contact.add_phone("+" + number, is_primary_mobile_no=1)
 	contact.insert(ignore_permissions=True)
 	return contact.name
+
+
+def find_contact(number):
+	"""Existing contact whose phone matches however it was typed: 62812.., +62 812-.., 0812.."""
+	# shortcut: only Indonesia's 0 trunk prefix is mapped; add other country codes if customers come from abroad
+	candidates = [number] + (["0" + number[2:]] if number.startswith("62") else [])
+	row = frappe.db.sql(
+		"""select parent from `tabContact Phone`
+		where parenttype = 'Contact' and regexp_replace(phone, '[^0-9]', '') in %(candidates)s
+		order by modified desc limit 1""",
+		{"candidates": candidates},
+	)
+	return row[0][0] if row else None
 
 
 def link_message(msg, ticket, log=True):
@@ -406,7 +467,27 @@ def split_inline_images(html):
 		if src.startswith(("/files/", "/private/files/")) and frappe.db.exists("File", {"file_url": src}):
 			urls.append(src)
 		img.decompose()
-	return html2text(str(soup)).strip(), urls
+	return WhatsAppConverter().convert(str(soup)).strip(), urls
+
+
+class WhatsAppConverter(MarkdownConverter):
+	"""HTML -> WhatsApp formatting (*bold*, _italic_, ~strike~), not markdown (**bold**)."""
+
+	def __init__(self):
+		# WhatsApp shows backslash escapes literally
+		super().__init__(bullets="•", escape_asterisks=False, escape_underscores=False, escape_misc=False)
+
+	convert_b = convert_strong = abstract_inline_conversion(lambda self: "*")
+	convert_em = convert_i = abstract_inline_conversion(lambda self: "_")
+	convert_del = convert_s = abstract_inline_conversion(lambda self: "~")
+
+	def convert_a(self, el, text, parent_tags):
+		href = el.get("href") or ""
+		return text if not href or href == text or "_inline" in parent_tags else f"{text} ({href})"
+
+	def convert_hN(self, n, el, text, parent_tags):
+		text = text.strip()
+		return f"\n\n*{text}*\n\n" if text and "_inline" not in parent_tags else text
 
 
 def media_type(file_name):

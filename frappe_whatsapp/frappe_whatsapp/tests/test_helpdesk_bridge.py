@@ -31,10 +31,14 @@ def run():
 			# routing swallows errors into Error Log; surface them here
 			patch.object(helpdesk.frappe, "log_error", _reraise),
 		):
-			_check_flow(sent)
-			_check_signature()
-			_check_evolution()
-			_check_departments()
+			_check_format_and_contact()
+			_check_off_hours()
+			# flows below must not depend on the clock
+			with patch.object(helpdesk, "off_hours_note", lambda *a, **k: None):
+				_check_flow(sent)
+				_check_signature()
+				_check_evolution()
+				_check_departments()
 		print("helpdesk bridge self-check: OK")
 	finally:
 		frappe.db.rollback()
@@ -118,7 +122,7 @@ def _check_flow(sent):
 	sent.clear()
 	with patch.object(frappe.db, "commit"), patch.object(frappe.db, "rollback"):
 		helpdesk.send_reply(comm.name, number)
-	assert sent[0]["type"] == "text" and "Baik, kami **cek** dulu." in sent[0]["text"]["body"], sent
+	assert sent[0]["type"] == "text" and "Baik, kami *cek* dulu." in sent[0]["text"]["body"], sent
 	assert sent[1]["type"] == "document" and sent[1]["document"] == {"id": "MEDIA123", "filename": "selfcheck-invoice.txt"}, sent
 
 	# 7. a failed send is noted on the ticket instead of being lost
@@ -132,6 +136,37 @@ def _check_flow(sent):
 	):
 		helpdesk.send_reply(comm.name, number)
 	assert frappe.db.exists("Comment", {"reference_name": ticket, "content": ["like", "%token expired%"]})
+
+
+def _check_format_and_contact():
+	# agent editor HTML -> WhatsApp markup, no markdown or backslash escapes
+	text, _ = helpdesk.split_inline_images(
+		"<p>Halo <b>Budi</b>, <i>cek</i> <s>lama</s> a_b 2*3</p><ul><li>satu</li><li>dua</li></ul>"
+		'<h3>Judul</h3><p><a href="https://x.id/a">link</a> <a href="https://x.id">https://x.id</a></p>'
+	)
+	assert text == "Halo *Budi*, _cek_ ~lama~ a_b 2*3\n\n• satu\n• dua\n\n*Judul*\n\nlink (https://x.id/a) https://x.id", repr(text)
+
+	# a contact saved as 0812-... is found for 62812...
+	number = f"62997{random.randint(1000000, 9999999)}"
+	contact = frappe.get_doc({"doctype": "Contact", "first_name": "Format Test"})
+	contact.add_phone(f"0{number[2:5]}-{number[5:9]} {number[9:]}", is_primary_mobile_no=1)
+	contact.insert(ignore_permissions=True)
+	assert helpdesk.get_or_create_contact(number, "x") == contact.name
+	assert helpdesk.find_contact("1" + number) is None
+
+
+def _check_off_hours():
+	from datetime import datetime, timedelta
+
+	sla = frappe.new_doc("HD Service Level Agreement")
+	for day in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"):
+		sla.append("support_and_resolution", {"workday": day, "start_time": timedelta(hours=10), "end_time": timedelta(hours=18)})
+	with patch.object(helpdesk.frappe, "get_cached_doc", lambda *a: sla):
+		note = lambda *args: helpdesk.off_hours_note("x", datetime(2026, 11, *args))
+		assert note(11, 12, 0) is None  # Wednesday noon
+		assert note(11, 8, 0).endswith("mulai Rabu, 11 November pukul 10.00."), note(11, 8, 0)
+		assert note(13, 19, 30).endswith("mulai Senin, 16 November pukul 10.00."), note(13, 19, 30)
+		assert note(14, 12, 0).startswith(helpdesk.OFF_HOURS_PREFIX) and "Senin, 16 November" in note(14, 12, 0)
 
 
 def _check_signature():
@@ -264,6 +299,15 @@ def _check_evolution():
 		assert third and third not in (ticket, new_ticket), third
 		assert frappe.db.get_value("HD Ticket", third, "subject") != "Menu"
 		assert frappe.db.get_value("WhatsApp Message", {"message_id": "E9"}, "reference_name") == new_ticket
+
+		# 6e. off hours: messages on the open ticket get one note, not one per message
+		calls.clear()
+		note = helpdesk.OFF_HOURS_PREFIX + " Pesan Anda sudah kami terima dan akan dibalas mulai Senin."
+		with patch.object(helpdesk, "off_hours_note", lambda *a, **k: note):
+			evolution.save_incoming(account, evo_msg("E11", {"conversation": "malam kak"}))
+			evolution.save_incoming(account, evo_msg("E12", {"conversation": "masih ada orang?"}))
+		assert [b["text"] for p, b in calls if "sendText" in p] == [note], calls
+		assert frappe.db.get_value("WhatsApp Message", {"message_id": "E12"}, "reference_name") == third
 
 		# 6d. agent resolves -> one closing message; Resolved -> Closed sends no second one
 		calls.clear()
