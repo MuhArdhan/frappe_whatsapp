@@ -31,7 +31,7 @@ def helpdesk_installed():
 	return "helpdesk" in frappe.get_installed_apps()
 
 
-def setup_custom_fields():
+def setup_custom_fields(app_name=None):
 	"""after_migrate: field that marks a ticket as a WhatsApp conversation."""
 	if not helpdesk_installed():
 		return

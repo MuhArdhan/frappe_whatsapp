@@ -20,7 +20,7 @@ def enabled():
 	return "helpdesk" in installed and "erpnext" in installed
 
 
-def setup_custom_fields():
+def setup_custom_fields(app_name=None):
 	if not enabled():
 		return
 	create_custom_fields(

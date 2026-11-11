@@ -241,3 +241,6 @@ after_migrate = [
     "frappe_whatsapp.helpdesk.setup_custom_fields",
     "frappe_whatsapp.helpdesk_departments.setup_custom_fields",
 ]
+# a fresh install never runs after_migrate; after_app_install covers helpdesk/erpnext installed later
+after_install = after_migrate
+after_app_install = after_migrate
